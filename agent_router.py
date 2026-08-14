@@ -24,7 +24,11 @@ import json
 import argparse
 import asyncio
 import logging
+import sqlite3
+import time
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -300,6 +304,120 @@ def _auth_headers(token: str, anthropic: bool = False) -> Dict[str, str]:
     return headers
 
 
+# ============ cc-switch 用量统计 ============
+CC_SWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
+HERMES_APP_TYPE = "hermes"
+HERMES_PROVIDER_ID = "hermes-router"
+
+
+def extract_usage_from_json(data: dict) -> tuple:
+    """从 OpenAI 格式响应 JSON 提取 (input_tokens, output_tokens)"""
+    try:
+        usage = data.get("usage") or {}
+        prompt = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+        completion = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+        return int(prompt), int(completion)
+    except Exception:
+        return 0, 0
+
+
+def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
+                             status_code: int, latency_ms: int, stream: bool):
+    """把 Hermes 用量写入 cc-switch 统计 DB。model 必须是实际转发的模型名。"""
+    if not CC_SWITCH_DB.exists():
+        return
+    now = int(time.time())
+    request_id = f"{HERMES_APP_TYPE}-{now}-{uuid.uuid4().hex[:8]}"
+    conn = None
+    try:
+        conn = sqlite3.connect(str(CC_SWITCH_DB), timeout=5)
+        conn.execute(
+            """INSERT INTO proxy_request_logs
+                (request_id, provider_id, app_type, model, request_model,
+                 input_tokens, output_tokens, input_cost_usd, output_cost_usd,
+                 total_cost_usd, latency_ms, status_code, is_streaming,
+                 cost_multiplier, created_at, data_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (request_id, HERMES_PROVIDER_ID, HERMES_APP_TYPE, model, model,
+             max(0, input_tokens), max(0, output_tokens),
+             "0", "0", "0", max(0, latency_ms), status_code,
+             1 if stream else 0, "1.0", now, HERMES_APP_TYPE)
+        )
+        # 更新日汇总：先查后改（避免依赖 ON CONFLICT 的唯一约束）
+        ok = 1 if 200 <= status_code < 400 else 0
+        row = conn.execute(
+            """SELECT request_count, input_tokens, output_tokens FROM usage_daily_rollups
+               WHERE date = date('now') AND app_type = ? AND provider_id = ?
+                 AND model = ? AND request_model = ? AND pricing_model = ''""",
+            (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model)
+        ).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE usage_daily_rollups SET
+                     request_count = request_count + 1,
+                     success_count = success_count + ?,
+                     input_tokens = input_tokens + ?,
+                     output_tokens = output_tokens + ?,
+                     avg_latency_ms = (? + avg_latency_ms * request_count) / (request_count + 1)
+                   WHERE date = date('now') AND app_type = ? AND provider_id = ?
+                     AND model = ? AND request_model = ? AND pricing_model = ''""",
+                (ok, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms),
+                 HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model)
+            )
+        else:
+            conn.execute(
+                """INSERT INTO usage_daily_rollups
+                    (date, app_type, provider_id, model, request_model, pricing_model,
+                     request_count, success_count, input_tokens, output_tokens,
+                     cache_read_tokens, cache_creation_tokens,
+                     total_cost_usd, avg_latency_ms)
+                 VALUES (date('now'), ?, ?, ?, ?, '', 1, ?, ?, ?, 0, 0, '0', ?)""",
+                (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model,
+                 ok, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms))
+            )
+        conn.commit()
+        logger.debug(f"usage recorded: model={model} in={input_tokens} out={output_tokens} stream={stream}")
+    except Exception as e:
+        logger.warning(f"cc-switch usage write failed: {e}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int):
+    """流式转发包装器：透传 SSE chunk，流结束后解析 usage 并写入 cc-switch。"""
+    chunks = []
+    try:
+        async for chunk in resp.aiter_bytes():
+            chunks.append(chunk)
+            yield chunk
+    finally:
+        # 流结束，尝试从 SSE 中解析 usage
+        input_tokens = output_tokens = 0
+        try:
+            full = b"".join(chunks).decode("utf-8", errors="ignore")
+            for line in full.split("\n"):
+                line = line.strip()
+                if line.startswith("data: "):
+                    payload = line[6:].strip()
+                    if payload == "[DONE]":
+                        continue
+                    data = json.loads(payload)
+                    if data.get("usage"):
+                        input_tokens, output_tokens = extract_usage_from_json(data)
+                        break
+        except Exception:
+            pass
+        if not input_tokens:
+            input_tokens = max(1, prompt_len // 4)  # 兜底估算
+        latency_ms = int((time.time() - start_time) * 1000)
+        write_usage_to_cc_switch(model, input_tokens, output_tokens,
+                                 resp.status_code, latency_ms, stream=True)
+
+
 # ============ 转发逻辑 ============
 async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> str:
     """统一决定目标档位。
@@ -327,17 +445,20 @@ async def forward_openai(body: Dict[str, Any], token: str) -> Response:
     headers = _auth_headers(token)
     stream = out_body.get("stream", False)
     prompt = extract_prompt_openai(body)
+    start_time = time.time()
 
     try:
         async with _semaphore:
             if stream:
+                # 请求 Ollama Cloud 在流末尾返回带 usage 的 chunk
+                out_body["stream_options"] = {"include_usage": True}
                 req = _client.build_request("POST", f"{OLLAMA_BASE}/chat/completions",
                                             json=out_body, headers=headers)
                 resp = await _client.send(req, stream=True)
                 logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
                             f"prompt_len={len(prompt)} tier={tier}")
                 return StreamingResponse(
-                    resp.aiter_bytes(),
+                    stream_with_usage(resp, model, start_time, len(prompt)),
                     status_code=resp.status_code,
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache"},
@@ -348,6 +469,14 @@ async def forward_openai(body: Dict[str, Any], token: str) -> Response:
                                           json=out_body, headers=headers)
                 logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
                             f"prompt_len={len(prompt)} tier={tier}")
+                latency_ms = int((time.time() - start_time) * 1000)
+                try:
+                    data = resp.json()
+                    input_tokens, output_tokens = extract_usage_from_json(data)
+                    write_usage_to_cc_switch(model, input_tokens, output_tokens,
+                                             resp.status_code, latency_ms, stream=False)
+                except Exception as e:
+                    logger.warning(f"usage extract failed: {e}")
                 return Response(content=resp.content, status_code=resp.status_code,
                                 media_type="application/json")
     except Exception as e:
