@@ -131,7 +131,7 @@ def get_ollama_token() -> Optional[str]:
     return value
 
 # ============ 难度路由 ============
-# 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro) / 0.95-1 难(glm5.2)
+# 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro/judge) / 0.95-1 难(glm5.2)
 # 分数越高 = 任务越难
 
 # 简单信号(闲聊/问候/短指令) → 降低难度
@@ -189,8 +189,8 @@ def difficulty_score(prompt: str) -> float:
 
 
 # 模糊地带: 规则分数落在此区间时, 用 LLM 二次判断
-# 规则拿不准的边界(0.7-0.95), 避免误判
-LLM_JUDGE_LOW = 0.7
+# 规则拿不准的边界(0.8-0.95), 避免误判
+LLM_JUDGE_LOW = 0.8
 LLM_JUDGE_HIGH = 0.95  # 贵模型(glm5.2)触发阈值
 
 # LLM judge 用 flash(便宜快), 判断 prompt 难度
