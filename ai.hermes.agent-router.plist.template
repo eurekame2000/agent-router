@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.hermes.agent-router</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string><USER>/.hermes/router-venv/bin/python</string>
+        <string><USER>/.hermes/scripts/agent_router.py</string>
+        <string>--port</string>
+        <string>18001</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string><USER>/.hermes</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string><USER>/.hermes/router-venv/bin:/opt/homebrew/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>VIRTUAL_ENV</key>
+        <string><USER>/.hermes/router-venv</string>
+        <key>HERMES_HOME</key>
+        <string><USER>/.hermes</string>
+    </dict>
+
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string><USER>/.hermes/logs/router.log</string>
+
+    <key>StandardErrorPath</key>
+    <string><USER>/.hermes/logs/router.error.log</string>
+</dict>
+</plist>
