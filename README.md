@@ -23,6 +23,49 @@ Claude (Anthropic)  ─┘
 - 模糊地带（0.7–0.9）：用 flash 二次 LLM judge（失败保守回退 medium）
 - Token 从 `~/.hermes/config.yaml` 的 `api_key` 动态读取，不硬编码
 
+## 显式模型路由
+
+除难度自动路由外，可通过请求的 `model` 字段强制指定档位：
+
+| model 别名 | 行为 |
+|---|---|
+| `auto` / 未知名 | 难度自动路由（默认） |
+| `flash` / `cheap` / `deepseek-v4-flash:0731` | 固定 → flash |
+| `pro` / `medium` / `deepseek-v4-pro:preview` | 固定 → pro |
+| `smart` / `glm` / `glm-5.2` | 固定 → smart |
+
+`GET /v1/models` 返回 `auto / flash / pro / smart` 四项，Hermes 的 `/mode` picker 直接选用。
+
+### Hermes 显式切换（通过 custom provider）
+
+在 `~/.hermes/config.yaml` 的 `custom_providers` 加 4 个指向网关的 provider：
+
+```yaml
+custom_providers:
+  - name: "Router-auto"
+    model: "auto"
+    base_url: "http://127.0.0.1:18001/v1"
+    api_key: "dummy"      # 网关转发时用自己的 token，忽略此字段
+  - name: "Router-flash"
+    model: "flash"
+    base_url: "http://127.0.0.1:18001/v1"
+    api_key: "dummy"
+  - name: "Router-pro"
+    model: "pro"
+    base_url: "http://127.0.0.1:18001/v1"
+    api_key: "dummy"
+  - name: "Router-glm"
+    model: "smart"
+    base_url: "http://127.0.0.1:18001/v1"
+    api_key: "dummy"
+```
+
+然后 `hermes model` 选对应 provider，或 `/mode` picker 选 auto/flash/pro/smart。
+
+**⚠️ 注意**：
+1. `model.default` 必须保持 `auto`——若填真实模型名（如 `deepseek-v4-flash:0731`）会命中别名表导致永远固定档位，破坏难度路由。
+2. `hermes config set 'custom_providers' '[...]'` 会把数组存成 JSON 字符串而非原生 YAML 列表——直接编辑 config.yaml 或手动改回列表格式。
+
 ## 端点
 
 | 端点 | 协议 | 用途 |
