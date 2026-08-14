@@ -10,7 +10,7 @@
 
 难度路由:
   cheap  (deepseek-v4-flash:0731)  — 简单任务(短prompt/闲聊)
-  medium (deepseek-v4-pro:preview) — 常规任务(写代码/总结)
+  medium (kimi-k2.7-code)       — 常规任务(写代码/总结)
   smart  (glm-5.2)                 — 复杂任务(重构/调试/分析/长输入)
 
 用法:
@@ -46,10 +46,10 @@ for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all
 OLLAMA_BASE = "https://ollama.com/v1"
 
 # 模型档位 → Ollama Cloud 实际模型名(从 /api/tags 查证)
-# 用户指定排序(从易到难): flash → Pro → glm5.2
+# 用户指定排序(从易到难): flash → Kimi K2.7-code → glm5.2
 MODEL_TIERS = {
     "cheap":  "deepseek-v4-flash:0731",   # 简单任务 (存在)
-    "medium": "deepseek-v4-pro:preview",  # 常规任务 (存在, 注意是:preview)
+    "medium": "kimi-k2.7-code",           # 常规任务 (存在, Kimi K2.7 代码版)
     "smart":  "glm-5.2",                  # 复杂任务 (存在)
 }
 
@@ -66,10 +66,12 @@ MODEL_ALIASES = {
     "glm":   "smart",
     "glm5":  "smart",
     "glm5.2": "smart",
+    "kimi":  "medium",
+    "kimi2.7": "medium",
+    "kimi-k2.7-code": "medium",
     # 真实模型名(直接透传)
     "deepseek-v4-flash:0731": "cheap",
-    "deepseek-v4-pro":        "medium",
-    "deepseek-v4-pro:preview": "medium",
+    "kimi-k2.7-code":         "medium",
     "glm-5.2":                "smart",
     # 难度自动路由关键词
     "auto":        None,
@@ -419,7 +421,7 @@ async def list_models():
     tiers = [
         ("auto",  None, None),  # 难度自动路由
         ("flash", "cheap",  "deepseek-v4-flash:0731"),
-        ("pro",   "medium", "deepseek-v4-pro:preview"),
+        ("pro",   "medium", "kimi-k2.7-code"),
         ("smart", "smart",  "glm-5.2"),
     ]
     return {"object": "list", "data": [
