@@ -235,16 +235,14 @@ async def llm_judge(prompt: str, token: str) -> str:
 
 
 async def route_by_difficulty(prompt: str, token: str) -> str:
-    """混合路由: 规则粗筛, 模糊地带用 LLM 二次判断"""
+    """混合路由: 简单直接走 flash, 其余(含高难度)都用 LLM 二次判断"""
     score = difficulty_score(prompt)
 
-    # 明确区间: 直接规则路由, 零成本
-    if score >= LLM_JUDGE_HIGH:
-        return "smart"    # 难 → glm5.2
+    # 明确简单: 直接规则路由, 零成本
     if score < LLM_JUDGE_LOW:
         return "cheap"    # 易 → flash
 
-    # 模糊地带(0.7-0.9): 用 flash 二次判断
+    # 中等和高难度都走 LLM judge 确认(避免规则误判浪费贵模型)
     return await llm_judge(prompt, token)
 
 
