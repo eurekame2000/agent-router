@@ -17,7 +17,7 @@ Claude (Anthropic)  ─┘
 |---|---|---|
 | cheap | `deepseek-v4-flash:0731` | 简单任务（短 prompt / 闲聊） |
 | medium | `kimi-k2.7-code` | 常规任务（写代码 / 总结） |
-| smart | `glm-5.2` | 复杂任务（重构 / 调试 / 安全审计 / 长输入） |
+| smart | `glm-5.3-flash` | 复杂任务（重构 / 调试 / 安全审计 / 长输入） |
 
 - 规则打分：关键词 + 长度 + 简单信号压制，分数 <0.8 直判 cheap
 - 分数 ≥0.8（含高难度）都走 flash LLM judge 二次确认（避免规则误判浪费贵模型）
@@ -32,7 +32,7 @@ Claude (Anthropic)  ─┘
 | `auto` / 未知名 | 难度自动路由（默认） |
 | `flash` / `cheap` / `deepseek-v4-flash:0731` | 固定 → flash |
 | `pro` / `medium` / `kimi` / `kimi-k2.7-code` | 固定 → pro |
-| `smart` / `glm` / `glm-5.2` | 固定 → smart |
+| `smart` / `glm` / `glm-5.3-flash` | 固定 → smart |
 
 `GET /v1/models` 返回 `auto / flash / pro / smart` 四项，Hermes 的 `/mode` picker 直接选用。
 

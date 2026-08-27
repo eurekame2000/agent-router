@@ -11,7 +11,7 @@
 难度路由:
   cheap  (deepseek-v4-flash:0731)  — 简单任务(短prompt/闲聊)
   medium (kimi-k2.7-code)       — 常规任务(写代码/总结)
-  smart  (glm-5.2)                 — 复杂任务(重构/调试/分析/长输入)
+  smart  (glm-5.3-flash)          — 复杂任务(重构/调试/分析/长输入)
 
 用法:
   python3 agent_router.py            # 默认端口 18001 (与 launchd / .sh 一致)
@@ -54,7 +54,7 @@ OLLAMA_BASE = "https://ollama.com/v1"
 MODEL_TIERS = {
     "cheap":  "deepseek-v4-flash:0731",   # 简单任务 (存在)
     "medium": "kimi-k2.7-code",           # 常规任务 (存在, Kimi K2.7 代码版)
-    "smart":  "glm-5.2",                  # 复杂任务 (存在)
+    "smart":  "glm-5.3-flash",            # 复杂任务 (存在)
 }
 
 # 显式模型名/别名 → 档位。Hermes/Claude 传入的 model 若命中这里则固定路由到该档位,
@@ -76,7 +76,7 @@ MODEL_ALIASES = {
     # 真实模型名(直接透传)
     "deepseek-v4-flash:0731": "cheap",
     "kimi-k2.7-code":         "medium",
-    "glm-5.2":                "smart",
+    "glm-5.3-flash":          "smart",
     # 难度自动路由关键词
     "auto":        None,
     "router":      None,
@@ -132,9 +132,16 @@ def get_ollama_token() -> Optional[str]:
                     break
     except Exception:
         pass
-    _token_cache["value"] = value
-    _token_cache["mtime"] = mtime
-    return value
+    # 关键修复：只在读到有效 token 时更新缓存。
+    # 如果读到 None（文件正在被写入/截断/格式变化），保留上一个有效值，
+    # 避免竞态条件下持续返回 "no token" 导致 Hermes 重试风暴。
+    if value is not None:
+        _token_cache["value"] = value
+        _token_cache["mtime"] = mtime
+    else:
+        # 保留旧 mtime，等文件写完后下次调用会重新读取
+        pass
+    return _token_cache["value"]
 
 # ============ 难度路由 ============
 # 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro/judge) / 0.95-1 难(glm5.2)
@@ -551,7 +558,7 @@ async def list_models():
         ("auto",  None, None),  # 难度自动路由
         ("flash", "cheap",  "deepseek-v4-flash:0731"),
         ("pro",   "medium", "kimi-k2.7-code"),
-        ("smart", "smart",  "glm-5.2"),
+        ("smart", "smart",  "glm-5.3-flash"),
     ]
     return {"object": "list", "data": [
         {"id": alias, "object": "model", "owned_by": "agent-router",
