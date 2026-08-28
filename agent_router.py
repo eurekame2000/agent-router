@@ -10,7 +10,7 @@
 
 难度路由:
   cheap  (deepseek-v4-flash:0731)  — 简单任务(短prompt/闲聊)
-  medium (kimi-k2.7-code)       — 常规任务(写代码/总结)
+  medium (难度<0.8 deepseek-v4-flash / ≥0.8 glm-5.3-flash)  — 常规任务(写代码/总结), 按难度阈值分流省钱
   smart  (glm-5.3-flash)          — 复杂任务(重构/调试/分析/长输入)
 
 用法:
@@ -50,12 +50,28 @@ for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all
 OLLAMA_BASE = "https://ollama.com/v1"
 
 # 模型档位 → Ollama Cloud 实际模型名(从 /api/tags 查证)
-# 用户指定排序(从易到难): flash → Kimi K2.7-code → glm5.2
+# 用户指定排序(从易到难): flash → DeepSeek pro → glm5.3
+# 2026-08-29: 删除 kimi-k2.7-code。medium 档不再固定单一模型,
+#   而是按比例拆到 DeepSeek flash(便宜) 和 glm flash(强推理), 省 kimi 的钱。
 MODEL_TIERS = {
     "cheap":  "deepseek-v4-flash:0731",   # 简单任务 (存在)
-    "medium": "kimi-k2.7-code",           # 常规任务 (存在, Kimi K2.7 代码版)
+    "medium": "deepseek-v4-flash:0731",   # 常规任务 → 按比例分流(见 MEDIUM_SPLIT)
     "smart":  "glm-5.3-flash",            # 复杂任务 (存在)
 }
+
+# medium 档分流阈值: 按难度分数判断
+#   difficulty_score(prompt) <= MEDIUM_THRESHOLD → deepseek-v4-flash:0731 (便宜)
+#   difficulty_score(prompt) >  MEDIUM_THRESHOLD → glm-5.3-flash (强推理)
+# 0.8: 常规写代码/总结(0.8)走便宜的 deepseek-flash, 只有重构/审计/多关键词(0.9+)才走 glm-flash
+MEDIUM_THRESHOLD = 0.8
+
+def resolve_model(tier: str, prompt: str = "") -> str:
+    """根据档位解析实际模型名。medium 档按难度阈值分流(省钱)。"""
+    if tier == "medium":
+        if difficulty_score(prompt) <= MEDIUM_THRESHOLD:
+            return "deepseek-v4-flash:0731"   # 常规任务, 便宜够用
+        return "glm-5.3-flash"               # 偏难, 强推理
+    return MODEL_TIERS[tier]
 
 # 显式模型名/别名 → 档位。Hermes/Claude 传入的 model 若命中这里则固定路由到该档位,
 # 不再做难度自动路由。传 auto/router/difficulty 或未知名字 → 走难度路由。
@@ -70,12 +86,11 @@ MODEL_ALIASES = {
     "glm":   "smart",
     "glm5":  "smart",
     "glm5.2": "smart",
-    "kimi":  "medium",
-    "kimi2.7": "medium",
-    "kimi-k2.7-code": "medium",
+    "glm5.3": "smart",
+    "deepseek": "medium",
+    "ds":     "medium",
     # 真实模型名(直接透传)
     "deepseek-v4-flash:0731": "cheap",
-    "kimi-k2.7-code":         "medium",
     "glm-5.3-flash":          "smart",
     # 难度自动路由关键词
     "auto":        None,
@@ -443,7 +458,8 @@ async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> st
 async def forward_openai(body: Dict[str, Any], token: str) -> Response:
     """转发 OpenAI 协议请求到 Ollama Cloud"""
     tier = await _resolve_and_route(body, token, extract_prompt_openai)
-    model = MODEL_TIERS[tier]
+    prompt = extract_prompt_openai(body)
+    model = resolve_model(tier, prompt)
 
     # 替换模型名
     out_body = dict(body)
@@ -498,7 +514,8 @@ async def forward_anthropic(body: Dict[str, Any], token: str) -> Response:
     Anthropic 原生 /v1/messages 仅在兼容时可用; 此处原样透传。
     """
     tier = await _resolve_and_route(body, token, extract_prompt_anthropic)
-    model = MODEL_TIERS[tier]
+    prompt = extract_prompt_anthropic(body)
+    model = resolve_model(tier, prompt)
 
     out_body = dict(body)
     out_body["model"] = model
@@ -557,14 +574,16 @@ async def list_models():
     tiers = [
         ("auto",  None, None),  # 难度自动路由
         ("flash", "cheap",  "deepseek-v4-flash:0731"),
-        ("pro",   "medium", "kimi-k2.7-code"),
+        ("pro",   "medium", "medium-split"),
         ("smart", "smart",  "glm-5.3-flash"),
     ]
     return {"object": "list", "data": [
         {"id": alias, "object": "model", "owned_by": "agent-router",
          "model": MODEL_TIERS[real] if real else "auto",
          "description": "难度自动路由(推荐)" if alias == "auto"
-                        else f"{alias} → {MODEL_TIERS[real]}"}
+                        else (f"{alias} → 难度<0.8 deepseek-v4-flash / ≥0.8 glm-5.3-flash"
+                              if real == "medium"
+                              else f"{alias} → {MODEL_TIERS[real]}")}
         for alias, real, _ in tiers
     ]}
 
