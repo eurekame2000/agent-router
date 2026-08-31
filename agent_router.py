@@ -48,6 +48,52 @@ for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all
 
 # ============ 配置 ============
 OLLAMA_BASE = "https://ollama.com/v1"
+ZHIPU_BASE = "https://open.bigmodel.cn/api/paas/v4"
+
+# 多上游: 每个模型 → 候选上游链(按优先级)。配额耗尽/5xx 时自动降级到下一个。
+#   glm-5.3-flash: 智谱官方优先, 配额用完降级到 Ollama Cloud
+#   deepseek-v4-flash:0731: 仅 Ollama Cloud 有
+MODEL_UPSTREAMS = {
+    "glm-5.3-flash": [
+        ("zhipu", "glm-5.3-flash"),
+        ("ollama", "glm-5.3-flash"),
+    ],
+    "deepseek-v4-flash:0731": [
+        ("ollama", "deepseek-v4-flash:0731"),
+    ],
+}
+UPSTREAM_BASE = {
+    "ollama": OLLAMA_BASE,
+    "zhipu": ZHIPU_BASE,
+}
+
+# circuit breaker: 某上游连续失败 >= 阈值后进入冷却期, 期间跳过
+_UPSTREAM_FAILURES = {}   # upstream_name -> 连续失败次数
+_UPSTREAM_COOLDOWN_UNTIL = {}  # upstream_name -> 冷却截止时间戳
+_UPSTREAM_FAIL_THRESHOLD = 3
+_UPSTREAM_COOLDOWN_SECS = 60
+
+def _upstream_available(name: str) -> bool:
+    """检查上游是否在冷却期(连续失败过多则临时跳过)。"""
+    until = _UPSTREAM_COOLDOWN_UNTIL.get(name, 0)
+    if time.time() < until:
+        return False
+    return True
+
+def _upstream_success(name: str):
+    _UPSTREAM_FAILURES[name] = 0
+    _UPSTREAM_COOLDOWN_UNTIL.pop(name, None)
+
+def _upstream_fail(name: str):
+    _UPSTREAM_FAILURES[name] = _UPSTREAM_FAILURES.get(name, 0) + 1
+    if _UPSTREAM_FAILURES[name] >= _UPSTREAM_FAIL_THRESHOLD:
+        _UPSTREAM_COOLDOWN_UNTIL[name] = time.time() + _UPSTREAM_COOLDOWN_SECS
+        logger.warning(f"上游 {name} 连续失败 {_UPSTREAM_FAILURES[name]} 次, 冷却 {_UPSTREAM_COOLDOWN_SECS}s")
+        _UPSTREAM_FAILURES[name] = 0
+
+def _is_retryable_status(status: int) -> bool:
+    """可降级的状态码: 429(配额/限流) + 5xx(服务端错误)。4xx 其他(400/401/404)不降级。"""
+    return status == 429 or 500 <= status < 600
 
 # 模型档位 → Ollama Cloud 实际模型名(从 /api/tags 查证)
 # 用户指定排序(从易到难): flash → DeepSeek pro → glm5.3
@@ -157,6 +203,31 @@ def get_ollama_token() -> Optional[str]:
         # 保留旧 mtime，等文件写完后下次调用会重新读取
         pass
     return _token_cache["value"]
+
+
+# ============ 智谱 token 读取(独立文件, 不污染 config.yaml 的 ollama token) ============
+_ZHIPU_TOKEN_PATH = os.path.expanduser('~/.hermes/zhipu_key')
+_zhipu_token_cache = {"value": None, "mtime": 0}
+
+
+def get_zhipu_token() -> Optional[str]:
+    """从 ~/.hermes/zhipu_key 读取智谱官方 key(带 mtime 缓存)。"""
+    try:
+        mtime = os.path.getmtime(_ZHIPU_TOKEN_PATH)
+    except OSError:
+        return _zhipu_token_cache["value"]
+    if _zhipu_token_cache["value"] is not None and mtime == _zhipu_token_cache["mtime"]:
+        return _zhipu_token_cache["value"]
+    value = None
+    try:
+        with open(_ZHIPU_TOKEN_PATH) as f:
+            value = f.read().strip()
+    except Exception:
+        pass
+    if value:
+        _zhipu_token_cache["value"] = value
+        _zhipu_token_cache["mtime"] = mtime
+    return _zhipu_token_cache["value"]
 
 # ============ 难度路由 ============
 # 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro/judge) / 0.95-1 难(glm5.2)
@@ -455,100 +526,117 @@ async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> st
     return await route_by_difficulty(prompt, token)   # 难度自动路由
 
 
+async def _forward_with_failover(body: Dict[str, Any], token: str,
+                                 anthropic: bool = False) -> Response:
+    """按候选上游链转发, 429/5xx 自动降级到下一上游。
+
+    - 非流式: 完整降级循环, 可重试状态码(429/5xx)换下一上游。
+    - 流式: 请求阶段失败可降级; 拿到 200 响应头后锁定(不能中途换上游)。
+    - circuit breaker: 上游连续失败 >= 阈值进入冷却期, 期间跳过。
+    """
+    model = body.get("model", "")
+    chain = MODEL_UPSTREAMS.get(model, [("ollama", model)])
+    if anthropic:
+        # 智谱仅 OpenAI 协议(/v1/chat/completions), 无 /messages 端点。
+        # Anthropic 请求只走 ollama, 避免 404 不降级。
+        chain = [(n, m) for n, m in chain if n == "ollama"]
+    stream = body.get("stream", False)
+    prompt = extract_prompt_anthropic(body) if anthropic else extract_prompt_openai(body)
+    start_time = time.time()
+    last_err = None
+
+    for upstream_name, upstream_model in chain:
+        if not _upstream_available(upstream_name):
+            logger.info(f"上游 {upstream_name} 冷却中, 跳过")
+            continue
+        base = UPSTREAM_BASE[upstream_name]
+        up_token = get_zhipu_token() if upstream_name == "zhipu" else token
+        if not up_token:
+            logger.warning(f"上游 {upstream_name} 无 token, 跳过")
+            continue
+        out_body = dict(body)
+        out_body["model"] = upstream_model
+        headers = _auth_headers(up_token, anthropic=anthropic)
+        path = "/messages" if anthropic else "/chat/completions"
+        try:
+            async with _semaphore:
+                if stream:
+                    out_body["stream_options"] = {"include_usage": True}
+                    req = _client.build_request("POST", f"{base}{path}",
+                                                json=out_body, headers=headers)
+                    resp = await _client.send(req, stream=True)
+                else:
+                    resp = await _client.post(f"{base}{path}",
+                                              json=out_body, headers=headers)
+        except Exception as e:
+            _upstream_fail(upstream_name)
+            last_err = e
+            logger.warning(f"上游 {upstream_name} 请求异常 {type(e).__name__}: {str(e)[:150]}, 降级")
+            continue
+
+        # 非流式: 可重试状态码则降级
+        if not stream:
+            if _is_retryable_status(resp.status_code):
+                _upstream_fail(upstream_name)
+                logger.warning(f"上游 {upstream_name} status={resp.status_code}, 降级到下一上游")
+                await resp.aclose()
+                continue
+            _upstream_success(upstream_name)
+            latency_ms = int((time.time() - start_time) * 1000)
+            try:
+                data = resp.json()
+                input_tokens, output_tokens = extract_usage_from_json(data)
+                write_usage_to_cc_switch(upstream_model, input_tokens, output_tokens,
+                                         resp.status_code, latency_ms, stream=False)
+            except Exception:
+                pass
+            logger.info(f"openai[{stream}] upstream={resp.status_code} model={upstream_model} "
+                        f"upstream={upstream_name} prompt_len={len(prompt)}")
+            return Response(content=resp.content, status_code=resp.status_code,
+                            media_type="application/json")
+
+        # 流式: 拿到响应头后锁定。仅 429/5xx 响应头可降级。
+        if _is_retryable_status(resp.status_code):
+            _upstream_fail(upstream_name)
+            await resp.aclose()
+            logger.warning(f"上游 {upstream_name} stream status={resp.status_code}, 降级")
+            continue
+        _upstream_success(upstream_name)
+        logger.info(f"openai[{stream}] upstream={resp.status_code} model={upstream_model} "
+                    f"upstream={upstream_name} prompt_len={len(prompt)}")
+        return StreamingResponse(
+            stream_with_usage(resp, upstream_model, start_time, len(prompt)),
+            status_code=resp.status_code,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+            background=BackgroundTask(resp.aclose),
+        )
+
+    # 所有上游都失败
+    if last_err:
+        raise last_err
+    return Response(content=json.dumps({"error": "all upstreams failed"}),
+                    status_code=502, media_type="application/json")
+
+
 async def forward_openai(body: Dict[str, Any], token: str) -> Response:
-    """转发 OpenAI 协议请求到 Ollama Cloud"""
+    """转发 OpenAI 协议请求, 多上游自动降级"""
     tier = await _resolve_and_route(body, token, extract_prompt_openai)
     prompt = extract_prompt_openai(body)
     model = resolve_model(tier, prompt)
-
-    # 替换模型名
     out_body = dict(body)
     out_body["model"] = model
-
-    headers = _auth_headers(token)
-    stream = out_body.get("stream", False)
-    prompt = extract_prompt_openai(body)
-    start_time = time.time()
-
-    try:
-        async with _semaphore:
-            if stream:
-                # 请求 Ollama Cloud 在流末尾返回带 usage 的 chunk
-                out_body["stream_options"] = {"include_usage": True}
-                req = _client.build_request("POST", f"{OLLAMA_BASE}/chat/completions",
-                                            json=out_body, headers=headers)
-                resp = await _client.send(req, stream=True)
-                logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
-                            f"prompt_len={len(prompt)} tier={tier}")
-                return StreamingResponse(
-                    stream_with_usage(resp, model, start_time, len(prompt)),
-                    status_code=resp.status_code,
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache"},
-                    background=BackgroundTask(resp.aclose),
-                )
-            else:
-                resp = await _client.post(f"{OLLAMA_BASE}/chat/completions",
-                                          json=out_body, headers=headers)
-                logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
-                            f"prompt_len={len(prompt)} tier={tier}")
-                latency_ms = int((time.time() - start_time) * 1000)
-                try:
-                    data = resp.json()
-                    input_tokens, output_tokens = extract_usage_from_json(data)
-                    write_usage_to_cc_switch(model, input_tokens, output_tokens,
-                                             resp.status_code, latency_ms, stream=False)
-                except Exception as e:
-                    logger.warning(f"usage extract failed: {e}")
-                return Response(content=resp.content, status_code=resp.status_code,
-                                media_type="application/json")
-    except Exception as e:
-        logger.error(f"openai[{stream}] 转发异常 {type(e).__name__}: {str(e)[:200]}")
-        raise
+    return await _forward_with_failover(out_body, token, anthropic=False)
 
 
 async def forward_anthropic(body: Dict[str, Any], token: str) -> Response:
-    """转发 Anthropic 协议请求到 Ollama Cloud
-
-    注意: Ollama Cloud 仅提供 OpenAI 兼容端点(/v1/chat/completions),
-    Anthropic 原生 /v1/messages 仅在兼容时可用; 此处原样透传。
-    """
+    """转发 Anthropic 协议请求, 多上游自动降级(仅 ollama, 智谱无 /messages 端点)"""
     tier = await _resolve_and_route(body, token, extract_prompt_anthropic)
     prompt = extract_prompt_anthropic(body)
     model = resolve_model(tier, prompt)
-
     out_body = dict(body)
     out_body["model"] = model
-
-    headers = _auth_headers(token, anthropic=True)
-    stream = out_body.get("stream", False)
-    prompt = extract_prompt_anthropic(body)
-
-    try:
-        async with _semaphore:
-            if stream:
-                req = _client.build_request("POST", f"{OLLAMA_BASE}/messages",
-                                            json=out_body, headers=headers)
-                resp = await _client.send(req, stream=True)
-                logger.info(f"anthropic[{stream}] upstream={resp.status_code} model={model} "
-                            f"prompt_len={len(prompt)} tier={tier}")
-                return StreamingResponse(
-                    resp.aiter_bytes(),
-                    status_code=resp.status_code,
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache"},
-                    background=BackgroundTask(resp.aclose),
-                )
-            else:
-                resp = await _client.post(f"{OLLAMA_BASE}/messages",
-                                          json=out_body, headers=headers)
-                logger.info(f"anthropic[{stream}] upstream={resp.status_code} model={model} "
-                            f"prompt_len={len(prompt)} tier={tier}")
-                return Response(content=resp.content, status_code=resp.status_code,
-                                media_type="application/json")
-    except Exception as e:
-        logger.error(f"anthropic[{stream}] 转发异常 {type(e).__name__}: {str(e)[:200]}")
-        raise
+    return await _forward_with_failover(out_body, token, anthropic=True)
 
 
 # ============ FastAPI 应用 ============
