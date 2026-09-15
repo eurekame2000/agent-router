@@ -16,6 +16,15 @@
   smart  — 复杂任务: glm-5.3 → kimi-k3 → deepseek-v4-pro:0813 → qwen3.5:397b → minimax-m3 → glm-5.3-flash
   池内降级: 429/5xx/请求异常自动换下一个模型; 每模型独立熔断(连续3败 或 60s内失败率>50%且样本≥5 → 冷却5s)。
 
+难度自动路由(② 投机启动 + 事后升级, 2026-09-16):
+  不再在请求前同步调用 judge(省掉每轮 judge 的延迟 + token):
+    1) 新会话投机走 cheap 池(零延迟启动);
+    2) 响应完成后**异步**评估(用户请求+模型回答一起给 judge): ok / medium_hard / smart;
+    3) 连续 N=2 次"吃力"判定 → 升级锁存(latch): 该会话后续请求固定走高档位池;
+    4) latch 闲置 TTL 2h 过期; judge 失败/超时 → fail-open(不改变状态, 不误升级);
+    5) 会话键 = 首条用户消息前512字符 sha1[:16] —— 多轮请求带全量历史, 此键在会话内稳定。
+  显式档位/别名/真实模型名 → 固定路由, 不参与 escalation。
+
 用法:
   python3 agent_router.py            # 默认端口 18001 (与 launchd / .sh 一致)
   python3 agent_router.py --port 19000
@@ -23,7 +32,9 @@
 
 import os
 import sys
+import re
 import json
+import hashlib
 import argparse
 import asyncio
 import logging
@@ -159,19 +170,101 @@ def _is_retryable_status(status: int) -> bool:
     """可降级的状态码: 429(配额/限流) + 5xx(服务端错误)。4xx 其他(400/401/404)不降级。"""
     return status == 429 or 500 <= status < 600
 
-# 零成本快路径闸门: difficulty_score 低于此值 → 直接 cheap, 不调 judge。
+# ============ ② 投机启动 + 事后升级(escalation/latch) ============
 #
-# 历史遗留问题(2026-09-15 修复): 旧实现有 MEDIUM_THRESHOLD=0.8 被两处使用且语义冲突——
-#   route_by_difficulty 用它当"是否调 judge"的闸门(score>=0.8 才调),
-#   resolve_pool 又用它对 judge 返回的 medium 二次判定(score>0.8 → medium_hard)。
-# 结果: judge 只在 score>=0.8 时被调用, 它一旦返回 medium, resolve_pool 里 score>0.8
-# 必然成立 → medium 池在 auto 路由下永远不可达, 33%+ 流量被推给 medium_hard 池首
-# (glm-5.3-flash)。现改为: 阈值只做零成本闸门, medium/medium_hard/smart 的区分
-# 完全交给 judge(4 分类), tier 一经判定即为权威, 不再二次改写。
+# 动机: 旧实现在**请求前**同步调 judge 做 4 分类, 每轮都付一次 judge 往返
+# (延迟 + token), 而 agent 循环里绝大多数轮次是工具续写, 判定结果高度重复。
+# 现改为「先跑便宜的, 事后评」——参照 Switchyard 的 escalation 思路 + 自研 latch:
+#   1) 新会话投机走 cheap(零延迟, 不等任何分类器);
+#   2) 响应完成后异步把 (用户请求, 模型回答) 交给 judge 评估质量;
+#   3) 连续 ESCALATION_CONFIRMATIONS 次"吃力"判定 → 升级锁存该会话;
+#   4) latch 闲置 ESCALATION_LATCH_TTL 秒过期; judge 失败 → fail-open 不改状态。
 #
-# 取值依据: 带标签样本(28条)网格搜索+留一交叉验证, 0.5 时准确率 82~93%,
-# 而 0.8 仅 71%(8 个错例全是"真任务被误判 trivial → 走 cheap")。
-TRIVIAL_THRESHOLD = 0.5
+# 为什么用「请求+回答」而非单纯请求: 回答本身是质量证据——小模型答得浅薄/遗漏/
+# 跑偏时 judge 能直接看到, 这比只看 prompt 猜难度准得多(Switchyard 的实测结论)。
+
+# 连续多少次"吃力"判定才升级锁存(单次判定可能是噪声 → 需要确认)
+ESCALATION_CONFIRMATIONS = 2
+# latch 闲置过期时间(秒): 读即续期, 活跃会话保持锁存, 闲置 2h 自动回落投机 cheap
+ESCALATION_LATCH_TTL = 7200
+# 回答短于此长度不评估(空响应/工具占位轮没有评估价值)
+_ESCALATION_MIN_RESPONSE_CHARS = 40
+# 后台评估专用信号量: 与用户请求(_semaphore)隔离, 后台记账不挤占用户带宽
+_JUDGE_SEM = asyncio.Semaphore(3)
+# 持有后台任务引用, 防止 create_task 的协程被 GC 提前回收
+_BG_TASKS = set()
+
+# 档位序: 升级目标必须严格高于当前档位才构成升级信号
+_TIER_RANK = {"cheap": 0, "medium": 1, "medium_hard": 2, "smart": 3}
+
+# 会话状态(内存态, 进程重启即清空 —— latch 是会话级优化, 无持久化必要)
+_LATCH = {}          # conv_key -> (tier, 最后活跃 ts)
+_ESCALATION_CONF = {}  # conv_key -> (连续吃力计数, 最近一次目标档位)
+
+
+def _conv_key_from_text(first_user_text: str) -> str:
+    """首条用户消息 → 会话键(sha1[:16])"""
+    return hashlib.sha1((first_user_text or "").strip()[:512].encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def conversation_key(body: Dict[str, Any]) -> Optional[str]:
+    """从请求体推导会话指纹: 首条**有文本的**用户消息前 512 字符的 sha1[:16]。
+
+    agent 每一轮都带全量历史, 首条用户消息在会话内恒定 → 键稳定;
+    不同任务(不同首条消息)不会误碰撞。无用户文本(纯工具回传) → None, 不参与 escalation。
+    """
+    for m in body.get("messages", []):
+        if m.get("role") == "user":
+            text = _extract_text(m.get("content"))
+            if text and text.strip():
+                return _conv_key_from_text(text)
+    return None
+
+
+def latch_get(conv_key: Optional[str], now: Optional[float] = None) -> Optional[str]:
+    """读取锁存档位。闲置超过 TTL 自动过期; 命中则续期(以"读"当活跃信号)。"""
+    if not conv_key:
+        return None
+    ent = _LATCH.get(conv_key)
+    if not ent:
+        return None
+    tier, ts = ent
+    now = now if now is not None else time.time()
+    if now - ts > ESCALATION_LATCH_TTL:
+        del _LATCH[conv_key]
+        return None
+    _LATCH[conv_key] = (tier, now)      # 读即续期
+    return tier
+
+
+def apply_escalation_verdict(conv_key: Optional[str], verdict: Optional[str],
+                             current_tier: str, now: Optional[float] = None) -> str:
+    """消费一次事后评估结果, 返回动作描述(日志/测试可见)。
+
+    verdict ∈ {"ok", "medium_hard", "smart"}; None = judge 失败(fail-open)。
+      - ok        → 清零连续计数(小模型胜任的正面证据)
+      - 升级目标  → 计数 +1; 达 ESCALATION_CONFIRMATIONS → 写入 _LATCH 并清计数
+      - None      → 状态不变(网络抖动不算"吃力", 也不清零已有计数)
+    目标档位必须严格高于当前档位才计数(已经 smart 的会话不会被 medium_hard 再升)。
+    """
+    if not conv_key:
+        return "skip(非 auto 会话)"
+    if verdict is None:
+        return "fail-open(状态不变)"
+    if verdict == "ok":
+        _ESCALATION_CONF.pop(conv_key, None)
+        return "ok(计数清零)"
+    target = verdict
+    if _TIER_RANK.get(target, 0) <= _TIER_RANK.get(current_tier, 1):
+        return f"no-op({target} 不高于 {current_tier})"
+    conf, _ = _ESCALATION_CONF.get(conv_key, (0, None))
+    conf += 1
+    if conf >= ESCALATION_CONFIRMATIONS:
+        _LATCH[conv_key] = (target, now if now is not None else time.time())
+        _ESCALATION_CONF.pop(conv_key, None)
+        return f"LATCH→{target}"
+    _ESCALATION_CONF[conv_key] = (conf, target)
+    return f"confirm {conf}/{ESCALATION_CONFIRMATIONS}→{target}"
 
 def resolve_pool(tier: str, prompt: str = "", requested: Any = None) -> list:
     """根据档位返回候选模型池。
@@ -179,7 +272,7 @@ def resolve_pool(tier: str, prompt: str = "", requested: Any = None) -> list:
     - 调用方显式传入**真实模型名**(在池内) → 返回单元素池 [该模型], 精确锁定,
       不使用该档位池的首选, 也不降级到池内其他模型。
     - 其余 → MODEL_POOLS[tier] 完整降级链。tier 为权威判定结果(含 medium_hard),
-      此处**不再**用 difficulty_score 二次改写 —— 见 TRIVIAL_THRESHOLD 注释。
+      此处**不再**用规则分数二次改写 —— 判定权见 ② escalation 区块注释。
     """
     if requested:
         key = str(requested).strip()
@@ -289,128 +382,122 @@ def get_ollama_token() -> Optional[str]:
 
 
 # ============ 难度路由 ============
-# 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro/judge) / 0.95-1 难(glm5.2)
-# 分数越高 = 任务越难
-
-# 简单信号(闲聊/问候/短指令) → 降低难度
-EASY_KEYWORDS = [
-    "hi", "hello", "hey", "你好", "嗨", "谢谢", "thanks", "ok", "好的",
-    "bye", "再见", "who are you", "你是谁", "help", "帮助",
-]
-
-# 中等信号 → 中等加分
-MEDIUM_KEYWORDS = [
-    "write code", "implement", "review", "summarize", "create", "build",
-    "explain", "fix", "test", "写代码", "实现", "总结", "创建", "修复",
-    "解释", "测试", "函数", "function", "代码", "脚本", "程序", "算法",
-    "python", "javascript", "solidity", "sql", "java", "golang", "rust",
-    "怎么", "如何", "怎样", "为什么", "是什么", "区别", "对比",
-]
-
-# 复杂信号 → 高加分
-SMART_KEYWORDS = [
-    "refactor", "debug", "analyze", "explain architecture", "optimize",
-    "unit test", "deploy", "security audit", "vulnerability", "reentrancy",
-    "gas optimization", "architecture", "design pattern", "code review",
-    "重构", "调试", "分析", "优化", "审计", "漏洞", "架构", "设计模式",
-    "安全", "重入", "部署",
-]
+# 判定权已全部移交「事后评估」(见上方 ② 区块): 请求前不再做任何规则打分,
+# 规则分数/关键词表在 v1.5.0 移除(历史实现与坑见 docs/routing-defect-postmortem.md)。
 
 
-def difficulty_score(prompt: str) -> float:
-    """计算 prompt 难度分数(0-1), 越高越难"""
-    if not prompt:
-        return 0.5
-    pl = prompt.lower()
-    length = len(prompt)
-
-    # 简单信号(短闲聊) → 直接压到低分
-    if any(k in pl for k in EASY_KEYWORDS) and length < 50:
-        return 0.2
-
-    # 基础分 0.5, 关键词命中往上加
-    score = 0.5
-
-    # 中等信号: 每个 +0.15, 上限 +0.4
-    medium_hits = sum(1 for k in MEDIUM_KEYWORDS if k in pl)
-    score += min(medium_hits, 3) * 0.15
-
-    # 复杂信号: 每个 +0.2, 上限 +0.5
-    smart_hits = sum(1 for k in SMART_KEYWORDS if k in pl)
-    score += min(smart_hits, 3) * 0.2
-
-    # 长度贡献: 超过200字符额外加分, 上限 +0.1
-    if length > 200:
-        score += 0.1
-
-    return min(score, 1.0)
-
-
-# LLM judge 用 flash(便宜快), 判断 prompt 难度
-LLM_JUDGE_MODEL = "deepseek-v4-flash:0731"
-LLM_JUDGE_PROMPT = (
-    "你是任务难度分类器。判断下面用户请求的复杂度, 只输出一个词:\n"
-    "cheap(简单闲聊/打招呼/一句话/无需推理)\n"
-    "medium(常规任务: 写代码/总结/解释概念/改写)\n"
-    "medium_hard(中等偏难: 多步骤/需要一定推理/代码重构/调试单个问题)\n"
-    "smart(复杂任务: 系统架构设计/安全审计/长输入多步骤/跨领域综合分析)\n\n"
-    "只输出 cheap / medium / medium_hard / smart 中的一个词, 不要解释。\n\n"
-    "用户请求:\n{prompt}\n\n难度:"
+# 事后评估 judge: 用 flash(便宜快) 看「请求 + 回答」判断是否需要升级
+ESCALATION_JUDGE_MODEL = "deepseek-v4-flash:0731"
+ESCALATION_JUDGE_PROMPT = (
+    "你是模型路由质量评估器。下面是一个由**预算型小模型**生成的回答。\n"
+    "判断该回答是否胜任, 以及该会话是否需要升级到更强的模型池:\n"
+    "- 回答已充分、正确、符合请求 → 只输出: ok\n"
+    "- 请求中等偏难(多步骤/需推理/重构/调试单个问题), 回答勉强可用但明显粗糙 → 只输出: medium_hard\n"
+    "- 请求复杂(系统架构设计/安全审计/跨领域深度分析/长链路多步骤), 且回答明显吃力(浅薄/遗漏/混乱/有错) → 只输出: smart\n\n"
+    "只输出 ok / medium_hard / smart 中的一个词, 不要解释。\n\n"
+    "用户请求:\n{request}\n\n模型回答:\n{response}\n\n判定:"
 )
 
+# 推理型模型会输出 <think> 思考块, 解析前先剥掉
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)  # 剥离推理思考块
 
-async def llm_judge(prompt: str, token: str) -> str:
-    """用 flash 模型做权威难度分类, 返回档位(cheap/medium/medium_hard/smart)"""
+
+_VERDICT_RE = re.compile(r"medium_hard|medium|smart|ok")
+
+
+def parse_escalation_verdict(content: str) -> Optional[str]:
+    """解析 judge 输出为档位字符串; 无法识别返回 None。
+
+    取**最右侧**的判定词: judge 常在结论前带一句简短理由(如 基本可用, 但建议升级 smart),
+    真正的判定在末尾。同一位置下长档位优先(正则交替顺序已保证 medium_hard 先于 medium)。
+    ok 需为独立词, 避免 book/look 之类误命中。
+    """
+    c = _THINK_RE.sub("", content or "").strip().lower()
+    if not c:
+        return None
+    best = None
+    for mt in _VERDICT_RE.finditer(c):
+        w = mt.group(0)
+        if w == "ok":                      # 独立词校验(前后不得是 ASCII 字母)
+            prev = c[mt.start() - 1] if mt.start() > 0 else " "
+            nxt = c[mt.end()] if mt.end() < len(c) else " "
+            if (prev.isascii() and prev.isalpha()) or (nxt.isascii() and nxt.isalpha()):
+                continue
+        key = (mt.start(), len(w))
+        if best is None or key >= best[0]:
+            best = (key, w)
+    return best[1] if best else None
+
+
+async def judge_escalation(request_text: str, response_text: str, token: str) -> Optional[str]:
+    """事后质量评估。返回 ok/medium_hard/smart; 失败/超时/无法解析 → None(fail-open)。"""
     try:
-        async with _semaphore:
+        async with _JUDGE_SEM:
             resp = await _client.post(
                 f"{OLLAMA_BASE}/chat/completions",
                 json={
-                    "model": LLM_JUDGE_MODEL,
-                    "messages": [
-                        {"role": "user", "content": LLM_JUDGE_PROMPT.format(prompt=prompt[:2000])}
-                    ],
-                    "max_tokens": 200,
+                    "model": ESCALATION_JUDGE_MODEL,
+                    "messages": [{"role": "user", "content": ESCALATION_JUDGE_PROMPT.format(
+                        request=request_text[:2000], response=response_text[:4000])}],
+                    "max_tokens": 600,   # 推理型输出可能较长, 过小会返回空
                     "temperature": 0,
                 },
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                timeout=30,  # judge 单独收紧超时, 避免拖慢主请求
+                timeout=30,
             )
         if resp.status_code != 200:
-            logger.warning(f"llm_judge 非200 status={resp.status_code}, 回退 medium")
-            return "medium"  # 失败时保守回退到 medium
-        data = resp.json()
-        content = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip().lower()
-        # 注意: "medium_hard" 含子串 "medium", 必须先匹配长的
-        for tier in ("smart", "medium_hard", "medium", "cheap"):
-            if tier in content:
-                return tier
-        # judge 没给出可识别档位(含输出为空的推理模型) → 按规则分数兜底
-        fallback = "medium_hard" if difficulty_score(prompt) >= 0.8 else "medium"
-        logger.warning(f"llm_judge 输出无法识别({content[:40]!r}), 按规则分数回退 {fallback}")
-        return fallback
+            logger.warning(f"escalation judge 非200 status={resp.status_code}, fail-open")
+            return None
+        content = (resp.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "")
+        verdict = parse_escalation_verdict(content)
+        if verdict is None:
+            logger.warning(f"escalation judge 输出无法识别({content[:60]!r}), fail-open")
+        return verdict
     except Exception as e:
-        logger.error(f"llm_judge 异常 {type(e).__name__}: {str(e)[:200]}, 回退 medium")
-        return "medium"  # 异常时保守回退
+        logger.warning(f"escalation judge 异常 {type(e).__name__}: {str(e)[:150]}, fail-open")
+        return None
 
 
-async def route_by_difficulty(prompt: str, token: str) -> str:
-    """混合路由。
+async def _escalation_judge_worker(request_text: str, response_text: str,
+                                   current_tier: str, conv_key: str, token: str):
+    """后台任务: 评估 + 消费结果。任何异常都不外抛(fire-and-forget)。"""
+    try:
+        verdict = await judge_escalation(request_text, response_text, token)
+        action = apply_escalation_verdict(conv_key, verdict, current_tier)
+        logger.info(f"escalation: conv={conv_key[:8]} tier={current_tier} "
+                    f"verdict={verdict} → {action}")
+    except Exception as e:
+        logger.warning(f"escalation worker 异常 {type(e).__name__}: fail-open")
 
-    规则分数只做**零成本快路径闸门**: 明确 trivial → 直接 cheap, 不调 judge。
-    其余(含中等/偏难/复杂)全部交给 LLM judge 做权威 4 分类判定(cheap/medium/
-    medium_hard/smart), 返回值即为最终档位, 后续 resolve_pool 不再改写。
+
+def _schedule_escalation_judge(request_text: str, response_text: str,
+                               current_tier: str, conv_key: Optional[str], token: str):
+    """响应完成后调度异步评估(绝不阻塞用户流)。"""
+    if not conv_key:
+        return                                  # 显式档位/模型名请求不参与 escalation
+    if latch_get(conv_key):
+        return                                  # 已锁存 → 不再评估(latch = 不回落)
+    if len(response_text or "") < _ESCALATION_MIN_RESPONSE_CHARS:
+        return                                  # 空响应/占位轮无评估价值
+    task = asyncio.create_task(_escalation_judge_worker(
+        request_text[:2000], response_text[:4000], current_tier, conv_key, token))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+def speculative_route(body: Dict[str, Any]) -> tuple:
+    """auto 档路由决策: (tier, conv_key)。
+
+    已锁存会话 → 锁存档位; 其余(含新一轮会话) → 投机 cheap(零延迟, 不等分类器)。
+    事后由 _schedule_escalation_judge 评估并可能升级锁存。
     """
-    score = difficulty_score(prompt)
-
-    # 明确 trivial: 直接规则路由, 零成本
-    if score < TRIVIAL_THRESHOLD:
-        logger.info(f"route: score={score:.2f} < {TRIVIAL_THRESHOLD} → cheap (快路径)")
-        return "cheap"
-
-    tier = await llm_judge(prompt, token)
-    logger.info(f"route: score={score:.2f} → judge={tier} (len={len(prompt)})")
-    return tier
+    conv_key = conversation_key(body)
+    latched = latch_get(conv_key)
+    if latched:
+        logger.info(f"route: conv={(conv_key or '-')[:8]} → {latched} (latched)")
+        return latched, conv_key
+    logger.info(f"route: conv={(conv_key or '-')[:8]} → cheap (speculative)")
+    return "cheap", conv_key
 
 
 def _extract_text(content: Any) -> Optional[str]:
@@ -557,17 +644,23 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
 
 
 async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int,
-                            requested: str = None):
+                            requested: str = None, prompt: str = "",
+                            tier: str = None, conv_key: str = None, token: str = None):
     """流式转发包装器：透传 SSE chunk，流结束后解析 usage 并写入 cc-switch。
-    requested = 调用方原始请求的 model 字段, 透传给 write_usage 记入 request_model。"""
+
+    requested = 调用方原始请求的 model 字段, 透传给 write_usage 记入 request_model。
+    同时累积回答文本, 流结束后调度事后评估(escalation) —— 全程不阻塞用户流。
+    """
     chunks = []
     try:
         async for chunk in resp.aiter_bytes():
             chunks.append(chunk)
             yield chunk
     finally:
-        # 流结束，尝试从 SSE 中解析 usage
+        # 流结束，解析 SSE: 提取 usage + 累积回答文本
         input_tokens = output_tokens = 0
+        answer_parts = []
+        usage_found = False
         try:
             full = b"".join(chunks).decode("utf-8", errors="ignore")
             for line in full.split("\n"):
@@ -577,9 +670,12 @@ async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int
                     if payload == "[DONE]":
                         continue
                     data = json.loads(payload)
-                    if data.get("usage"):
+                    if data.get("usage") and not usage_found:
                         input_tokens, output_tokens = extract_usage_from_json(data)
-                        break
+                        usage_found = True
+                    piece = _sse_delta_text(data)
+                    if piece:
+                        answer_parts.append(piece)
         except Exception:
             pass
         if not input_tokens:
@@ -588,30 +684,59 @@ async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int
         write_usage_to_cc_switch(model, input_tokens, output_tokens,
                                  resp.status_code, latency_ms, stream=True,
                                  requested=requested)
+        # 事后评估(异步 fire-and-forget, 不影响已完成的用户响应)
+        if tier and token:
+            _schedule_escalation_judge(prompt, "".join(answer_parts), tier, conv_key, token)
 
 
 # ============ 转发逻辑 ============
-async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> str:
-    """统一决定目标档位。
+def _response_text(data: dict) -> str:
+    """从非流式响应 JSON 提取回答文本(兼容 OpenAI / Anthropic 两种格式)"""
+    ch = (data.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    text = _extract_text(msg.get("content"))
+    if text:
+        return text
+    return _extract_text(data.get("content")) or ""
 
-    优先: 传入 model 命中显式别名 → 固定档位(指定模型)。
-    否则: 走难度自动路由(auto / 未知模型名)。
+
+def _sse_delta_text(data: dict) -> str:
+    """从单个 SSE 事件 JSON 提取增量文本(兼容两种协议)"""
+    ch = (data.get("choices") or [{}])[0]
+    delta = ch.get("delta") or {}
+    t = delta.get("content")
+    if isinstance(t, str) and t:
+        return t
+    d2 = data.get("delta")          # Anthropic: content_block_delta → delta.text
+    if isinstance(d2, dict):
+        t2 = d2.get("text")
+        if isinstance(t2, str):
+            return t2
+    return ""
+
+
+async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> tuple:
+    """统一决定目标档位, 返回 (tier, conv_key)。
+
+    - 显式别名/档位/真实模型名 → 固定档位, conv_key=None(不参与 escalation)。
+    - auto/未知模型名 → 投机+锁存路由(见 speculative_route)。
     """
     requested = body.get("model")
     tier = resolve_tier(requested)
     if tier is not None:
-        return tier                      # 显式指定模型
-    prompt = extract_fn(body)
-    return await route_by_difficulty(prompt, token)   # 难度自动路由
+        return tier, None                # 显式指定模型
+    return speculative_route(body)
 
 
 async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
-                                 token: str, anthropic: bool = False) -> Response:
+                                 token: str, anthropic: bool = False,
+                                 conv_key: str = None) -> Response:
     """按档位模型池逐个尝试, 429/5xx/请求异常自动降级到池内下一个模型。
 
     - 非流式: 完整降级循环。
     - 流式: 请求阶段失败可降级; 拿到 200 响应头后锁定(不能中途换模型)。
     - circuit breaker: 某模型连续失败 >= 阈值进入冷却期, 期间跳过。
+    - conv_key 非空 = auto 会话, 响应完成后调度事后评估(escalation)。
     """
     pool = resolve_pool(tier, prompt, requested=body.get("model"))
     stream = body.get("stream", False)
@@ -665,10 +790,13 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
                 write_usage_to_cc_switch(model, input_tokens, output_tokens,
                                          resp.status_code, latency_ms, stream=False,
                                          requested=req_label)
+                answer_text = _response_text(data)
             except Exception:
-                pass
+                answer_text = ""
             logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
                         f"tier={tier} prompt_len={len(prompt)}")
+            # 事后评估(异步 fire-and-forget, 用户已拿到响应)
+            _schedule_escalation_judge(prompt, answer_text, tier, conv_key, token)
             return Response(content=resp.content, status_code=resp.status_code,
                             media_type="application/json")
 
@@ -683,7 +811,8 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
                     f"tier={tier} prompt_len={len(prompt)}")
         return StreamingResponse(
             stream_with_usage(resp, model, start_time, len(prompt),
-                              requested=req_label),
+                              requested=req_label, prompt=prompt,
+                              tier=tier, conv_key=conv_key, token=token),
             status_code=resp.status_code,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
@@ -700,16 +829,18 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
 
 async def forward_openai(body: Dict[str, Any], token: str) -> Response:
     """转发 OpenAI 协议请求, 档位模型池内自动降级"""
-    tier = await _resolve_and_route(body, token, extract_prompt_openai)
+    tier, conv_key = await _resolve_and_route(body, token, extract_prompt_openai)
     prompt = extract_prompt_openai(body)
-    return await _forward_with_failover(body, tier, prompt, token, anthropic=False)
+    return await _forward_with_failover(body, tier, prompt, token, anthropic=False,
+                                        conv_key=conv_key)
 
 
 async def forward_anthropic(body: Dict[str, Any], token: str) -> Response:
     """转发 Anthropic 协议请求, 档位模型池内自动降级(全走 ollama)"""
-    tier = await _resolve_and_route(body, token, extract_prompt_anthropic)
+    tier, conv_key = await _resolve_and_route(body, token, extract_prompt_anthropic)
     prompt = extract_prompt_anthropic(body)
-    return await _forward_with_failover(body, tier, prompt, token, anthropic=True)
+    return await _forward_with_failover(body, tier, prompt, token, anthropic=True,
+                                        conv_key=conv_key)
 
 
 # ============ FastAPI 应用 ============
@@ -719,15 +850,59 @@ async def lifespan(app: FastAPI):
     await _client.aclose()  # 优雅关闭: 释放共享连接池
 
 
-app = FastAPI(title="Agent Model Router", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Agent Model Router", version="1.5.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health():
+    now = time.time()
+    live_latch = {k: v for k, v in _LATCH.items()
+                  if now - v[1] <= ESCALATION_LATCH_TTL}
     return {"status": "ok", "version": app.version,
             "tiers": {k: v[0] + f" (+{len(v)-1} fallback)" if len(v) > 1 else v[0]
                       for k, v in MODEL_POOLS.items() if k != "medium_hard"},
-            "pools": MODEL_POOLS}
+            "pools": MODEL_POOLS,
+            "escalation": {
+                "latched": len(live_latch),
+                "pending": len(_ESCALATION_CONF),
+                "confirmations": ESCALATION_CONFIRMATIONS,
+                "ttl_secs": ESCALATION_LATCH_TTL,
+            }}
+
+
+@app.get("/internal/escalation")
+async def escalation_state():
+    """运维/测试用: 查看 latch 与待确认计数(会话键已缩短便于阅读)"""
+    now = time.time()
+    return {
+        "latches": [{"conv": k, "tier": t, "idle_secs": int(now - ts)}
+                    for k, (t, ts) in _LATCH.items()
+                    if now - ts <= ESCALATION_LATCH_TTL],
+        "pending": [{"conv": k, "count": c, "target": t}
+                    for k, (c, t) in _ESCALATION_CONF.items()],
+    }
+
+
+@app.post("/internal/escalation")
+async def escalation_control(request: Request):
+    """运维/测试用: 注入或清除某会话的 latch(用首条用户消息原文定位会话)。
+
+    {"text": "<首条用户消息>", "tier": "smart"}  → 注入 latch
+    {"text": "...", "clear": true}              → 清除 latch 与待确认计数
+    """
+    body = await request.json()
+    text = body.get("text") or ""
+    conv = _conv_key_from_text(text)
+    if body.get("clear"):
+        _LATCH.pop(conv, None)
+        _ESCALATION_CONF.pop(conv, None)
+        return {"conv": conv, "cleared": True}
+    tier = body.get("tier")
+    if tier not in MODEL_POOLS:
+        return Response(content=json.dumps({"error": f"tier 无效: {tier}"}),
+                        status_code=400, media_type="application/json")
+    _LATCH[conv] = (tier, time.time())
+    return {"conv": conv, "tier": tier}
 
 
 @app.get("/v1/models")
@@ -747,8 +922,8 @@ async def list_models():
             pool = MODEL_POOLS[real]
             desc = f"{alias} 池: {' → '.join(pool)}"
         else:
-            desc = ("难度自动路由(推荐): 规则分数<0.5 直接 cheap, 其余由 LLM judge "
-                    "4 分类(cheap/medium/medium_hard/smart) 权威判定")
+            desc = ("难度自动路由(推荐): 新会话投机走 cheap(零延迟不等分类器), 响应后"
+                    "异步评估(请求+回答); 连续 2 次判定吃力 → 升级锁存该会话(2h 内保持)")
         data.append({"id": alias, "object": "model", "owned_by": "agent-router",
                      "description": desc})
     return {"object": "list", "data": data}
