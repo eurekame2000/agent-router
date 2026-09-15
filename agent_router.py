@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-本地 Agent 模型路由网关 — 按任务难度路由到 Ollama Cloud 不同模型
+本地 Agent 模型路由网关 — 按任务难度选档位, 每档位一个候选模型池(Ollama Cloud)
 同时暴露 OpenAI 和 Anthropic 两套协议，兼容 Hermes 和 Claude Code。
 
 架构:
@@ -8,10 +8,13 @@
                         ├─→ 本网关 (难度路由) ─→ Ollama Cloud
   Claude (Anthropic)  ─┘
 
-难度路由:
-  cheap  (deepseek-v4-flash:0731)  — 简单任务(短prompt/闲聊)
-  medium (难度<0.8 deepseek-v4-flash / ≥0.8 glm-5.3-flash)  — 常规任务(写代码/总结), 按难度阈值分流省钱
-  smart  (glm-5.3-flash)          — 复杂任务(重构/调试/分析/长输入)
+档位模型池(2026-09-15, 智谱无额度剔除, 全走 Ollama Cloud):
+  cheap  — 简单任务: deepseek-v4.1-flash → deepseek-v4-flash:0731 → gpt-oss:20b
+  medium — 常规任务, 按难度分流:
+           ≤0.8: deepseek-v4.1-flash → kimi-k2.7-code → minimax-m2.7 → deepseek-v4-flash:0731
+           >0.8: glm-5.3-flash → kimi-k2.7-code → minimax-m3
+  smart  — 复杂任务: glm-5.3 → kimi-k3 → deepseek-v4-pro:0813 → qwen3.5:397b → minimax-m3 → glm-5.3-flash
+  池内降级: 429/5xx/请求异常自动换下一个模型; 每模型独立熔断(连续3败冷却60s)。
 
 用法:
   python3 agent_router.py            # 默认端口 18001 (与 launchd / .sh 一致)
@@ -48,28 +51,44 @@ for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all
 
 # ============ 配置 ============
 OLLAMA_BASE = "https://ollama.com/v1"
-ZHIPU_BASE = "https://open.bigmodel.cn/api/paas/v4"
 
-# 多上游: 每个模型 → 候选上游链(按优先级)。配额耗尽/5xx 时自动降级到下一个。
-#   glm-5.3-flash: 智谱官方优先, 配额用完降级到 Ollama Cloud
-#   deepseek-v4-flash:0731: 仅 Ollama Cloud 有
-MODEL_UPSTREAMS = {
-    "glm-5.3-flash": [
-        ("zhipu", "glm-5.3-flash"),
-        ("ollama", "glm-5.3-flash"),
+# 档位模型池(2026-09-15): 每档 = 有序候选模型列表(优先级从高到低)。
+# 依据公开资料按"能力 + token 成本"选型, 各系列取最新版; 智谱无额度已整体剔除。
+# 池内降级: 429(配额/限流)/5xx/请求异常 → 自动换下一个; 每模型独立熔断。
+MODEL_POOLS = {
+    # 简单任务(短prompt/闲聊): 轻量快模, 成本优先
+    "cheap": [
+        "deepseek-v4.1-flash",        # DeepSeek 最新 flash 代
+        "deepseek-v4-flash:0731",     # 上一代 flash, 现役验证款
+        "gpt-oss:20b",                # OpenAI 开源轻量
     ],
-    "deepseek-v4-flash:0731": [
-        ("ollama", "deepseek-v4-flash:0731"),
+    # 常规任务(写代码/总结)难度≤0.8: 便宜够用
+    "medium": [
+        "deepseek-v4.1-flash",
+        "kimi-k2.7-code",             # Kimi 代码特化
+        "minimax-m2.7",
+        "deepseek-v4-flash:0731",
+    ],
+    # 常规任务偏难(难度>0.8): 强推理但不上旗舰
+    "medium_hard": [
+        "glm-5.3-flash",
+        "kimi-k2.7-code",
+        "minimax-m3",
+    ],
+    # 复杂任务(重构/调试/分析/长输入): 旗舰池
+    "smart": [
+        "glm-5.3",                    # GLM 满血旗舰(实测延迟最低)
+        "kimi-k3",                    # Kimi 最新旗舰
+        "deepseek-v4-pro:0813",       # DeepSeek 旗舰
+        "qwen3.5:397b",               # Qwen 旗舰
+        "minimax-m3",                 # MiniMax 最新
+        "glm-5.3-flash",              # 兜底: 强推理 flash
     ],
 }
-UPSTREAM_BASE = {
-    "ollama": OLLAMA_BASE,
-    "zhipu": ZHIPU_BASE,
-}
 
-# circuit breaker: 某上游连续失败 >= 阈值后进入冷却期, 期间跳过
-_UPSTREAM_FAILURES = {}   # upstream_name -> 连续失败次数
-_UPSTREAM_COOLDOWN_UNTIL = {}  # upstream_name -> 冷却截止时间戳
+# circuit breaker: 某模型连续失败 >= 阈值后进入冷却期, 期间跳过(键=模型名)
+_UPSTREAM_FAILURES = {}   # model -> 连续失败次数
+_UPSTREAM_COOLDOWN_UNTIL = {}  # model -> 冷却截止时间戳
 _UPSTREAM_FAIL_THRESHOLD = 3
 _UPSTREAM_COOLDOWN_SECS = 60
 
@@ -95,29 +114,17 @@ def _is_retryable_status(status: int) -> bool:
     """可降级的状态码: 429(配额/限流) + 5xx(服务端错误)。4xx 其他(400/401/404)不降级。"""
     return status == 429 or 500 <= status < 600
 
-# 模型档位 → Ollama Cloud 实际模型名(从 /api/tags 查证)
-# 用户指定排序(从易到难): flash → DeepSeek pro → glm5.3
-# 2026-08-29: 删除 kimi-k2.7-code。medium 档不再固定单一模型,
-#   而是按比例拆到 DeepSeek flash(便宜) 和 glm flash(强推理), 省 kimi 的钱。
-MODEL_TIERS = {
-    "cheap":  "deepseek-v4-flash:0731",   # 简单任务 (存在)
-    "medium": "deepseek-v4-flash:0731",   # 常规任务 → 按比例分流(见 MEDIUM_SPLIT)
-    "smart":  "glm-5.3-flash",            # 复杂任务 (存在)
-}
-
-# medium 档分流阈值: 按难度分数判断
-#   difficulty_score(prompt) <= MEDIUM_THRESHOLD → deepseek-v4-flash:0731 (便宜)
-#   difficulty_score(prompt) >  MEDIUM_THRESHOLD → glm-5.3-flash (强推理)
-# 0.8: 常规写代码/总结(0.8)走便宜的 deepseek-flash, 只有重构/审计/多关键词(0.9+)才走 glm-flash
+# medium 档分流阈值: 按难度分数选子池
+#   difficulty_score(prompt) <= MEDIUM_THRESHOLD → MODEL_POOLS["medium"] (便宜够用)
+#   difficulty_score(prompt) >  MEDIUM_THRESHOLD → MODEL_POOLS["medium_hard"] (强推理)
+# 0.8: 常规写代码/总结(0.8)走便宜池, 只有重构/审计/多关键词(0.9+)才走强推理池
 MEDIUM_THRESHOLD = 0.8
 
-def resolve_model(tier: str, prompt: str = "") -> str:
-    """根据档位解析实际模型名。medium 档按难度阈值分流(省钱)。"""
-    if tier == "medium":
-        if difficulty_score(prompt) <= MEDIUM_THRESHOLD:
-            return "deepseek-v4-flash:0731"   # 常规任务, 便宜够用
-        return "glm-5.3-flash"               # 偏难, 强推理
-    return MODEL_TIERS[tier]
+def resolve_pool(tier: str, prompt: str = "") -> list:
+    """根据档位返回候选模型池。medium 档按难度阈值选子池(省钱)。"""
+    if tier == "medium" and difficulty_score(prompt) > MEDIUM_THRESHOLD:
+        return MODEL_POOLS["medium_hard"]
+    return MODEL_POOLS[tier]
 
 # 显式模型名/别名 → 档位。Hermes/Claude 传入的 model 若命中这里则固定路由到该档位,
 # 不再做难度自动路由。传 auto/router/difficulty 或未知名字 → 走难度路由。
@@ -135,9 +142,18 @@ MODEL_ALIASES = {
     "glm5.3": "smart",
     "deepseek": "medium",
     "ds":     "medium",
-    # 真实模型名(直接透传)
+    # 真实模型名(透传 → 归档到主力档位)
+    "deepseek-v4.1-flash":    "cheap",
     "deepseek-v4-flash:0731": "cheap",
+    "gpt-oss:20b":            "cheap",
+    "kimi-k2.7-code":         "medium",
+    "minimax-m2.7":           "medium",
     "glm-5.3-flash":          "smart",
+    "glm-5.3":                "smart",
+    "kimi-k3":                "smart",
+    "deepseek-v4-pro:0813":   "smart",
+    "qwen3.5:397b":           "smart",
+    "minimax-m3":             "smart",
     # 难度自动路由关键词
     "auto":        None,
     "router":      None,
@@ -205,29 +221,6 @@ def get_ollama_token() -> Optional[str]:
     return _token_cache["value"]
 
 
-# ============ 智谱 token 读取(独立文件, 不污染 config.yaml 的 ollama token) ============
-_ZHIPU_TOKEN_PATH = os.path.expanduser('~/.hermes/zhipu_key')
-_zhipu_token_cache = {"value": None, "mtime": 0}
-
-
-def get_zhipu_token() -> Optional[str]:
-    """从 ~/.hermes/zhipu_key 读取智谱官方 key(带 mtime 缓存)。"""
-    try:
-        mtime = os.path.getmtime(_ZHIPU_TOKEN_PATH)
-    except OSError:
-        return _zhipu_token_cache["value"]
-    if _zhipu_token_cache["value"] is not None and mtime == _zhipu_token_cache["mtime"]:
-        return _zhipu_token_cache["value"]
-    value = None
-    try:
-        with open(_ZHIPU_TOKEN_PATH) as f:
-            value = f.read().strip()
-    except Exception:
-        pass
-    if value:
-        _zhipu_token_cache["value"] = value
-        _zhipu_token_cache["mtime"] = mtime
-    return _zhipu_token_cache["value"]
 
 # ============ 难度路由 ============
 # 难度分数区间(用户指定): 0-0.8 易(flash) / 0.8-0.95 中(Pro/judge) / 0.95-1 难(glm5.2)
@@ -397,6 +390,7 @@ def _auth_headers(token: str, anthropic: bool = False) -> Dict[str, str]:
     return headers
 
 
+
 # ============ cc-switch 用量统计 ============
 CC_SWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 HERMES_APP_TYPE = "hermes"
@@ -526,117 +520,101 @@ async def _resolve_and_route(body: Dict[str, Any], token: str, extract_fn) -> st
     return await route_by_difficulty(prompt, token)   # 难度自动路由
 
 
-async def _forward_with_failover(body: Dict[str, Any], token: str,
-                                 anthropic: bool = False) -> Response:
-    """按候选上游链转发, 429/5xx 自动降级到下一上游。
+async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
+                                 token: str, anthropic: bool = False) -> Response:
+    """按档位模型池逐个尝试, 429/5xx/请求异常自动降级到池内下一个模型。
 
-    - 非流式: 完整降级循环, 可重试状态码(429/5xx)换下一上游。
-    - 流式: 请求阶段失败可降级; 拿到 200 响应头后锁定(不能中途换上游)。
-    - circuit breaker: 上游连续失败 >= 阈值进入冷却期, 期间跳过。
+    - 非流式: 完整降级循环。
+    - 流式: 请求阶段失败可降级; 拿到 200 响应头后锁定(不能中途换模型)。
+    - circuit breaker: 某模型连续失败 >= 阈值进入冷却期, 期间跳过。
     """
-    model = body.get("model", "")
-    chain = MODEL_UPSTREAMS.get(model, [("ollama", model)])
-    if anthropic:
-        # 智谱仅 OpenAI 协议(/v1/chat/completions), 无 /messages 端点。
-        # Anthropic 请求只走 ollama, 避免 404 不降级。
-        chain = [(n, m) for n, m in chain if n == "ollama"]
+    pool = resolve_pool(tier, prompt)
     stream = body.get("stream", False)
-    prompt = extract_prompt_anthropic(body) if anthropic else extract_prompt_openai(body)
     start_time = time.time()
     last_err = None
 
-    for upstream_name, upstream_model in chain:
-        if not _upstream_available(upstream_name):
-            logger.info(f"上游 {upstream_name} 冷却中, 跳过")
-            continue
-        base = UPSTREAM_BASE[upstream_name]
-        up_token = get_zhipu_token() if upstream_name == "zhipu" else token
-        if not up_token:
-            logger.warning(f"上游 {upstream_name} 无 token, 跳过")
+    for model in pool:
+        if not _upstream_available(model):
+            logger.info(f"模型 {model} 冷却中, 跳过")
             continue
         out_body = dict(body)
-        out_body["model"] = upstream_model
-        headers = _auth_headers(up_token, anthropic=anthropic)
+        out_body["model"] = model
+        headers = _auth_headers(token, anthropic=anthropic)
         path = "/messages" if anthropic else "/chat/completions"
         try:
             async with _semaphore:
                 if stream:
                     out_body["stream_options"] = {"include_usage": True}
-                    req = _client.build_request("POST", f"{base}{path}",
+                    req = _client.build_request("POST", f"{OLLAMA_BASE}{path}",
                                                 json=out_body, headers=headers)
                     resp = await _client.send(req, stream=True)
                 else:
-                    resp = await _client.post(f"{base}{path}",
+                    resp = await _client.post(f"{OLLAMA_BASE}{path}",
                                               json=out_body, headers=headers)
         except Exception as e:
-            _upstream_fail(upstream_name)
+            _upstream_fail(model)
             last_err = e
-            logger.warning(f"上游 {upstream_name} 请求异常 {type(e).__name__}: {str(e)[:150]}, 降级")
+            logger.warning(f"模型 {model} 请求异常 {type(e).__name__}: {str(e)[:150]}, 降级到下一个")
             continue
 
         # 非流式: 可重试状态码则降级
         if not stream:
             if _is_retryable_status(resp.status_code):
-                _upstream_fail(upstream_name)
-                logger.warning(f"上游 {upstream_name} status={resp.status_code}, 降级到下一上游")
+                _upstream_fail(model)
+                logger.warning(f"模型 {model} status={resp.status_code}, 降级到池内下一个")
                 await resp.aclose()
                 continue
-            _upstream_success(upstream_name)
+            _upstream_success(model)
             latency_ms = int((time.time() - start_time) * 1000)
             try:
                 data = resp.json()
                 input_tokens, output_tokens = extract_usage_from_json(data)
-                write_usage_to_cc_switch(upstream_model, input_tokens, output_tokens,
+                write_usage_to_cc_switch(model, input_tokens, output_tokens,
                                          resp.status_code, latency_ms, stream=False)
             except Exception:
                 pass
-            logger.info(f"openai[{stream}] upstream={resp.status_code} model={upstream_model} "
-                        f"upstream={upstream_name} prompt_len={len(prompt)}")
+            logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
+                        f"tier={tier} prompt_len={len(prompt)}")
             return Response(content=resp.content, status_code=resp.status_code,
                             media_type="application/json")
 
         # 流式: 拿到响应头后锁定。仅 429/5xx 响应头可降级。
         if _is_retryable_status(resp.status_code):
-            _upstream_fail(upstream_name)
+            _upstream_fail(model)
             await resp.aclose()
-            logger.warning(f"上游 {upstream_name} stream status={resp.status_code}, 降级")
+            logger.warning(f"模型 {model} stream status={resp.status_code}, 降级到池内下一个")
             continue
-        _upstream_success(upstream_name)
-        logger.info(f"openai[{stream}] upstream={resp.status_code} model={upstream_model} "
-                    f"upstream={upstream_name} prompt_len={len(prompt)}")
+        _upstream_success(model)
+        logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
+                    f"tier={tier} prompt_len={len(prompt)}")
         return StreamingResponse(
-            stream_with_usage(resp, upstream_model, start_time, len(prompt)),
+            stream_with_usage(resp, model, start_time, len(prompt)),
             status_code=resp.status_code,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
             background=BackgroundTask(resp.aclose),
         )
 
-    # 所有上游都失败
+    # 池内全部模型失败
     if last_err:
         raise last_err
-    return Response(content=json.dumps({"error": "all upstreams failed"}),
+    return Response(content=json.dumps({"error": "all models in pool failed",
+                                        "tier": tier}),
                     status_code=502, media_type="application/json")
 
 
 async def forward_openai(body: Dict[str, Any], token: str) -> Response:
-    """转发 OpenAI 协议请求, 多上游自动降级"""
+    """转发 OpenAI 协议请求, 档位模型池内自动降级"""
     tier = await _resolve_and_route(body, token, extract_prompt_openai)
     prompt = extract_prompt_openai(body)
-    model = resolve_model(tier, prompt)
-    out_body = dict(body)
-    out_body["model"] = model
-    return await _forward_with_failover(out_body, token, anthropic=False)
+    return await _forward_with_failover(body, tier, prompt, token, anthropic=False)
 
 
 async def forward_anthropic(body: Dict[str, Any], token: str) -> Response:
-    """转发 Anthropic 协议请求, 多上游自动降级(仅 ollama, 智谱无 /messages 端点)"""
+    """转发 Anthropic 协议请求, 档位模型池内自动降级(全走 ollama)"""
     tier = await _resolve_and_route(body, token, extract_prompt_anthropic)
     prompt = extract_prompt_anthropic(body)
-    model = resolve_model(tier, prompt)
-    out_body = dict(body)
-    out_body["model"] = model
-    return await _forward_with_failover(out_body, token, anthropic=True)
+    return await _forward_with_failover(body, tier, prompt, token, anthropic=True)
 
 
 # ============ FastAPI 应用 ============
@@ -651,7 +629,9 @@ app = FastAPI(title="Agent Model Router", version="1.1.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "models": MODEL_TIERS}
+    return {"status": "ok", "tiers": {k: v[0] + f" (+{len(v)-1} fallback)" if len(v) > 1 else v[0]
+                                       for k, v in MODEL_POOLS.items() if k != "medium_hard"},
+            "pools": MODEL_POOLS}
 
 
 @app.get("/v1/models")
@@ -660,20 +640,23 @@ async def list_models():
     作为 model 传给 /chat/completions, 因此 id 必须命中 MODEL_ALIASES。
     """
     tiers = [
-        ("auto",  None, None),  # 难度自动路由
-        ("flash", "cheap",  "deepseek-v4-flash:0731"),
-        ("pro",   "medium", "medium-split"),
-        ("smart", "smart",  "glm-5.3-flash"),
+        ("auto",  None),
+        ("flash", "cheap"),
+        ("pro",   "medium"),
+        ("smart", "smart"),
     ]
-    return {"object": "list", "data": [
-        {"id": alias, "object": "model", "owned_by": "agent-router",
-         "model": MODEL_TIERS[real] if real else "auto",
-         "description": "难度自动路由(推荐)" if alias == "auto"
-                        else (f"{alias} → 难度<0.8 deepseek-v4-flash / ≥0.8 glm-5.3-flash"
-                              if real == "medium"
-                              else f"{alias} → {MODEL_TIERS[real]}")}
-        for alias, real, _ in tiers
-    ]}
+    data = []
+    for alias, real in tiers:
+        if real:
+            pool = MODEL_POOLS[real]
+            desc = f"{alias} 池: {' → '.join(pool)}"
+            if real == "medium":
+                desc += f" (难度>{MEDIUM_THRESHOLD} 改走: {' → '.join(MODEL_POOLS['medium_hard'])})"
+        else:
+            desc = "难度自动路由(推荐)"
+        data.append({"id": alias, "object": "model", "owned_by": "agent-router",
+                     "description": desc})
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
@@ -721,11 +704,13 @@ def main():
         print("❌ 无法从 ~/.hermes/config.yaml 读取 Ollama token", file=sys.stderr)
         sys.exit(1)
 
-    print(f"🚀 Agent Model Router v1.1.0 启动")
+    print(f"🚀 Agent Model Router v1.2.0 启动")
     print(f"   OpenAI 协议:  http://{args.host}:{args.port}/v1/chat/completions (Hermes用)")
     print(f"   Anthropic协议: http://{args.host}:{args.port}/v1/messages (Claude用)")
-    print(f"   模型档位: {MODEL_TIERS}")
     print(f"   后端: {OLLAMA_BASE}")
+    for tier, pool in MODEL_POOLS.items():
+        if tier != "medium_hard":
+            print(f"   {tier:6s}池: {' → '.join(pool)}")
     print(f"   并发上限: {MAX_CONCURRENCY}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
