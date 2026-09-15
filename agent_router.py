@@ -14,7 +14,7 @@
            ≤0.8: deepseek-v4.1-flash → kimi-k2.7-code → minimax-m2.7 → deepseek-v4-flash:0731
            >0.8: glm-5.3-flash → kimi-k2.7-code → minimax-m3
   smart  — 复杂任务: glm-5.3 → kimi-k3 → deepseek-v4-pro:0813 → qwen3.5:397b → minimax-m3 → glm-5.3-flash
-  池内降级: 429/5xx/请求异常自动换下一个模型; 每模型独立熔断(连续3败冷却60s)。
+  池内降级: 429/5xx/请求异常自动换下一个模型; 每模型独立熔断(连续3败 或 60s内失败率>50%且样本≥5 → 冷却5s)。
 
 用法:
   python3 agent_router.py            # 默认端口 18001 (与 launchd / .sh 一致)
@@ -30,6 +30,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -90,29 +91,69 @@ MODEL_POOLS = {
 # (而非档位名/别名) → 精确锁定到该模型, 不再替换为该档位池的首选。
 ALL_POOL_MODELS = {m for pool in MODEL_POOLS.values() for m in pool}
 
-# circuit breaker: 某模型连续失败 >= 阈值后进入冷却期, 期间跳过(键=模型名)
-_UPSTREAM_FAILURES = {}   # model -> 连续失败次数
+# circuit breaker: 每个上游独立熔断, 双门限任一触发即冷却(键=模型名)
+#   门限A(低流量快速熔断): 连续失败 >= _UPSTREAM_ALLOWED_FAILS
+#   门限B(高流量按比例):   窗口内样本 >= _UPSTREAM_MIN_REQUESTS 且 失败率 > _UPSTREAM_FAILURE_PERCENT
+#   门限B 的意义: 连续计数会被一次成功清零, 而"间歇性失败"(成功-失败-成功交替)的高失败率
+#   上游不会被门限A抓住 —— 这正是 LiteLLM cooldown_handlers.py 用比例门限要解决的问题。
+# 设计参照 LiteLLM: percent=0.5 / min_requests=5 / allowed_fails=3 / cooldown=5s。
+_UPSTREAM_WINDOW = {}          # model -> deque[(ts, ok)], 失败率统计窗口
+_UPSTREAM_FAILURES = {}        # model -> 连续失败次数
 _UPSTREAM_COOLDOWN_UNTIL = {}  # model -> 冷却截止时间戳
-_UPSTREAM_FAIL_THRESHOLD = 3
-_UPSTREAM_COOLDOWN_SECS = 60
+_UPSTREAM_WINDOW_SECS = 60     # 失败率统计窗口(秒)
+_UPSTREAM_MIN_REQUESTS = 5     # 比例门限要求的最小样本数
+_UPSTREAM_FAILURE_PERCENT = 0.5  # 比例门限的失败率阈值
+_UPSTREAM_ALLOWED_FAILS = 3    # 连续失败门限
+_UPSTREAM_COOLDOWN_SECS = 5    # 冷却时长(原 60s 对已恢复的上游过度惩罚)
 
 def _upstream_available(name: str) -> bool:
-    """检查上游是否在冷却期(连续失败过多则临时跳过)。"""
+    """检查上游是否在冷却期。冷却期满则重置该上游的失败计数与窗口(干净重试)。"""
     until = _UPSTREAM_COOLDOWN_UNTIL.get(name, 0)
     if time.time() < until:
         return False
+    if name in _UPSTREAM_COOLDOWN_UNTIL:
+        _UPSTREAM_COOLDOWN_UNTIL.pop(name, None)
+        _UPSTREAM_FAILURES.pop(name, None)
+        _UPSTREAM_WINDOW.pop(name, None)
     return True
 
+def _upstream_record(name: str, ok: bool):
+    """记录一次上游调用结果, 按双门限判定是否熔断。"""
+    now = time.time()
+    window = _UPSTREAM_WINDOW.setdefault(name, deque(maxlen=64))
+    window.append((now, ok))
+    # 老化: 丢弃窗口外的旧样本
+    cutoff = now - _UPSTREAM_WINDOW_SECS
+    while window and window[0][0] < cutoff:
+        window.popleft()
+
+    if ok:
+        _UPSTREAM_FAILURES[name] = 0  # 成功清零连续计数(但保留窗口样本供比例门限)
+        return
+
+    consecutive = _UPSTREAM_FAILURES.get(name, 0) + 1
+    _UPSTREAM_FAILURES[name] = consecutive
+    total = len(window)
+    fails = sum(1 for _, o in window if not o)
+    rate = (fails / total) if total else 0.0
+
+    reason = None
+    if consecutive >= _UPSTREAM_ALLOWED_FAILS:
+        reason = f"连续失败 {consecutive} 次"
+    elif total >= _UPSTREAM_MIN_REQUESTS and rate > _UPSTREAM_FAILURE_PERCENT:
+        reason = f"{_UPSTREAM_WINDOW_SECS}s 内失败率 {rate:.0%}({fails}/{total})"
+
+    if reason:
+        _UPSTREAM_COOLDOWN_UNTIL[name] = now + _UPSTREAM_COOLDOWN_SECS
+        logger.warning(f"上游 {name} {reason}, 冷却 {_UPSTREAM_COOLDOWN_SECS}s")
+        _UPSTREAM_FAILURES.pop(name, None)
+        _UPSTREAM_WINDOW.pop(name, None)
+
 def _upstream_success(name: str):
-    _UPSTREAM_FAILURES[name] = 0
-    _UPSTREAM_COOLDOWN_UNTIL.pop(name, None)
+    _upstream_record(name, True)
 
 def _upstream_fail(name: str):
-    _UPSTREAM_FAILURES[name] = _UPSTREAM_FAILURES.get(name, 0) + 1
-    if _UPSTREAM_FAILURES[name] >= _UPSTREAM_FAIL_THRESHOLD:
-        _UPSTREAM_COOLDOWN_UNTIL[name] = time.time() + _UPSTREAM_COOLDOWN_SECS
-        logger.warning(f"上游 {name} 连续失败 {_UPSTREAM_FAILURES[name]} 次, 冷却 {_UPSTREAM_COOLDOWN_SECS}s")
-        _UPSTREAM_FAILURES[name] = 0
+    _upstream_record(name, False)
 
 def _is_retryable_status(status: int) -> bool:
     """可降级的状态码: 429(配额/限流) + 5xx(服务端错误)。4xx 其他(400/401/404)不降级。"""
@@ -640,13 +681,14 @@ async def lifespan(app: FastAPI):
     await _client.aclose()  # 优雅关闭: 释放共享连接池
 
 
-app = FastAPI(title="Agent Model Router", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Agent Model Router", version="1.3.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "tiers": {k: v[0] + f" (+{len(v)-1} fallback)" if len(v) > 1 else v[0]
-                                       for k, v in MODEL_POOLS.items() if k != "medium_hard"},
+    return {"status": "ok", "version": "1.3.0",
+            "tiers": {k: v[0] + f" (+{len(v)-1} fallback)" if len(v) > 1 else v[0]
+                      for k, v in MODEL_POOLS.items() if k != "medium_hard"},
             "pools": MODEL_POOLS}
 
 
@@ -720,7 +762,7 @@ def main():
         print("❌ 无法从 ~/.hermes/config.yaml 读取 Ollama token", file=sys.stderr)
         sys.exit(1)
 
-    print(f"🚀 Agent Model Router v1.2.0 启动")
+    print(f"🚀 Agent Model Router v1.3.0 启动")
     print(f"   OpenAI 协议:  http://{args.host}:{args.port}/v1/chat/completions (Hermes用)")
     print(f"   Anthropic协议: http://{args.host}:{args.port}/v1/messages (Claude用)")
     print(f"   后端: {OLLAMA_BASE}")
