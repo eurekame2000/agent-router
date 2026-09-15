@@ -86,6 +86,10 @@ MODEL_POOLS = {
     ],
 }
 
+# 所有档位池内的真实模型名集合。用于识别"调用方显式传的是具体模型名"
+# (而非档位名/别名) → 精确锁定到该模型, 不再替换为该档位池的首选。
+ALL_POOL_MODELS = {m for pool in MODEL_POOLS.values() for m in pool}
+
 # circuit breaker: 某模型连续失败 >= 阈值后进入冷却期, 期间跳过(键=模型名)
 _UPSTREAM_FAILURES = {}   # model -> 连续失败次数
 _UPSTREAM_COOLDOWN_UNTIL = {}  # model -> 冷却截止时间戳
@@ -120,8 +124,20 @@ def _is_retryable_status(status: int) -> bool:
 # 0.8: 常规写代码/总结(0.8)走便宜池, 只有重构/审计/多关键词(0.9+)才走强推理池
 MEDIUM_THRESHOLD = 0.8
 
-def resolve_pool(tier: str, prompt: str = "") -> list:
-    """根据档位返回候选模型池。medium 档按难度阈值选子池(省钱)。"""
+def resolve_pool(tier: str, prompt: str = "", requested: Any = None) -> list:
+    """根据档位返回候选模型池。
+
+    - 调用方显式传入**真实模型名**(在池内) → 返回单元素池 [该模型], 精确锁定,
+      不使用该档位池的首选, 也不降级到池内其他模型。
+    - tier == "medium" → 按难度阈值选 medium / medium_hard 子池。
+    - 其余 → MODEL_POOLS[tier] 完整降级链。
+    """
+    if requested:
+        key = str(requested).strip()
+        low = key.lower()
+        for m in ALL_POOL_MODELS:
+            if m.lower() == low:
+                return [m]                     # 精确锁定显式模型
     if tier == "medium" and difficulty_score(prompt) > MEDIUM_THRESHOLD:
         return MODEL_POOLS["medium_hard"]
     return MODEL_POOLS[tier]
@@ -528,7 +544,7 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
     - 流式: 请求阶段失败可降级; 拿到 200 响应头后锁定(不能中途换模型)。
     - circuit breaker: 某模型连续失败 >= 阈值进入冷却期, 期间跳过。
     """
-    pool = resolve_pool(tier, prompt)
+    pool = resolve_pool(tier, prompt, requested=body.get("model"))
     stream = body.get("stream", False)
     start_time = time.time()
     last_err = None
