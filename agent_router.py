@@ -159,19 +159,27 @@ def _is_retryable_status(status: int) -> bool:
     """可降级的状态码: 429(配额/限流) + 5xx(服务端错误)。4xx 其他(400/401/404)不降级。"""
     return status == 429 or 500 <= status < 600
 
-# medium 档分流阈值: 按难度分数选子池
-#   difficulty_score(prompt) <= MEDIUM_THRESHOLD → MODEL_POOLS["medium"] (便宜够用)
-#   difficulty_score(prompt) >  MEDIUM_THRESHOLD → MODEL_POOLS["medium_hard"] (强推理)
-# 0.8: 常规写代码/总结(0.8)走便宜池, 只有重构/审计/多关键词(0.9+)才走强推理池
-MEDIUM_THRESHOLD = 0.8
+# 零成本快路径闸门: difficulty_score 低于此值 → 直接 cheap, 不调 judge。
+#
+# 历史遗留问题(2026-09-15 修复): 旧实现有 MEDIUM_THRESHOLD=0.8 被两处使用且语义冲突——
+#   route_by_difficulty 用它当"是否调 judge"的闸门(score>=0.8 才调),
+#   resolve_pool 又用它对 judge 返回的 medium 二次判定(score>0.8 → medium_hard)。
+# 结果: judge 只在 score>=0.8 时被调用, 它一旦返回 medium, resolve_pool 里 score>0.8
+# 必然成立 → medium 池在 auto 路由下永远不可达, 33%+ 流量被推给 medium_hard 池首
+# (glm-5.3-flash)。现改为: 阈值只做零成本闸门, medium/medium_hard/smart 的区分
+# 完全交给 judge(4 分类), tier 一经判定即为权威, 不再二次改写。
+#
+# 取值依据: 带标签样本(28条)网格搜索+留一交叉验证, 0.5 时准确率 82~93%,
+# 而 0.8 仅 71%(8 个错例全是"真任务被误判 trivial → 走 cheap")。
+TRIVIAL_THRESHOLD = 0.5
 
 def resolve_pool(tier: str, prompt: str = "", requested: Any = None) -> list:
     """根据档位返回候选模型池。
 
     - 调用方显式传入**真实模型名**(在池内) → 返回单元素池 [该模型], 精确锁定,
       不使用该档位池的首选, 也不降级到池内其他模型。
-    - tier == "medium" → 按难度阈值选 medium / medium_hard 子池。
-    - 其余 → MODEL_POOLS[tier] 完整降级链。
+    - 其余 → MODEL_POOLS[tier] 完整降级链。tier 为权威判定结果(含 medium_hard),
+      此处**不再**用 difficulty_score 二次改写 —— 见 TRIVIAL_THRESHOLD 注释。
     """
     if requested:
         key = str(requested).strip()
@@ -179,8 +187,9 @@ def resolve_pool(tier: str, prompt: str = "", requested: Any = None) -> list:
         for m in ALL_POOL_MODELS:
             if m.lower() == low:
                 return [m]                     # 精确锁定显式模型
-    if tier == "medium" and difficulty_score(prompt) > MEDIUM_THRESHOLD:
-        return MODEL_POOLS["medium_hard"]
+    if tier not in MODEL_POOLS:
+        logger.warning(f"resolve_pool: 未知档位 {tier!r}, 回退 medium")
+        tier = "medium"
     return MODEL_POOLS[tier]
 
 # 显式模型名/别名 → 档位。Hermes/Claude 传入的 model 若命中这里则固定路由到该档位,
@@ -337,23 +346,21 @@ def difficulty_score(prompt: str) -> float:
     return min(score, 1.0)
 
 
-# 模糊地带: 规则分数落在此区间时, 用 LLM 二次判断
-# 规则拿不准的边界(0.8-0.95), 避免误判
-LLM_JUDGE_LOW = 0.8
-LLM_JUDGE_HIGH = 0.95  # 贵模型(glm5.2)触发阈值
-
 # LLM judge 用 flash(便宜快), 判断 prompt 难度
 LLM_JUDGE_MODEL = "deepseek-v4-flash:0731"
 LLM_JUDGE_PROMPT = (
-    "你是任务难度分类器。判断下面用户请求的复杂度, 只输出一个词: "
-    "cheap(简单闲聊/一句话/无需推理) / medium(常规任务/写代码/总结/解释) / "
-    "smart(复杂任务/重构/调试/架构/安全审计/长输入多步骤)。\n\n"
+    "你是任务难度分类器。判断下面用户请求的复杂度, 只输出一个词:\n"
+    "cheap(简单闲聊/打招呼/一句话/无需推理)\n"
+    "medium(常规任务: 写代码/总结/解释概念/改写)\n"
+    "medium_hard(中等偏难: 多步骤/需要一定推理/代码重构/调试单个问题)\n"
+    "smart(复杂任务: 系统架构设计/安全审计/长输入多步骤/跨领域综合分析)\n\n"
+    "只输出 cheap / medium / medium_hard / smart 中的一个词, 不要解释。\n\n"
     "用户请求:\n{prompt}\n\n难度:"
 )
 
 
 async def llm_judge(prompt: str, token: str) -> str:
-    """用 flash 模型二次判断难度, 返回档位(cheap/medium/smart)"""
+    """用 flash 模型做权威难度分类, 返回档位(cheap/medium/medium_hard/smart)"""
     try:
         async with _semaphore:
             resp = await _client.post(
@@ -374,25 +381,36 @@ async def llm_judge(prompt: str, token: str) -> str:
             return "medium"  # 失败时保守回退到 medium
         data = resp.json()
         content = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip().lower()
-        for tier in ("smart", "medium", "cheap"):
+        # 注意: "medium_hard" 含子串 "medium", 必须先匹配长的
+        for tier in ("smart", "medium_hard", "medium", "cheap"):
             if tier in content:
                 return tier
-        return "medium"
+        # judge 没给出可识别档位(含输出为空的推理模型) → 按规则分数兜底
+        fallback = "medium_hard" if difficulty_score(prompt) >= 0.8 else "medium"
+        logger.warning(f"llm_judge 输出无法识别({content[:40]!r}), 按规则分数回退 {fallback}")
+        return fallback
     except Exception as e:
         logger.error(f"llm_judge 异常 {type(e).__name__}: {str(e)[:200]}, 回退 medium")
         return "medium"  # 异常时保守回退
 
 
 async def route_by_difficulty(prompt: str, token: str) -> str:
-    """混合路由: 简单直接走 flash, 其余(含高难度)都用 LLM 二次判断"""
+    """混合路由。
+
+    规则分数只做**零成本快路径闸门**: 明确 trivial → 直接 cheap, 不调 judge。
+    其余(含中等/偏难/复杂)全部交给 LLM judge 做权威 4 分类判定(cheap/medium/
+    medium_hard/smart), 返回值即为最终档位, 后续 resolve_pool 不再改写。
+    """
     score = difficulty_score(prompt)
 
-    # 明确简单: 直接规则路由, 零成本
-    if score < LLM_JUDGE_LOW:
-        return "cheap"    # 易 → flash
+    # 明确 trivial: 直接规则路由, 零成本
+    if score < TRIVIAL_THRESHOLD:
+        logger.info(f"route: score={score:.2f} < {TRIVIAL_THRESHOLD} → cheap (快路径)")
+        return "cheap"
 
-    # 中等和高难度都走 LLM judge 确认(避免规则误判浪费贵模型)
-    return await llm_judge(prompt, token)
+    tier = await llm_judge(prompt, token)
+    logger.info(f"route: score={score:.2f} → judge={tier} (len={len(prompt)})")
+    return tier
 
 
 def _extract_text(content: Any) -> Optional[str]:
@@ -701,12 +719,12 @@ async def lifespan(app: FastAPI):
     await _client.aclose()  # 优雅关闭: 释放共享连接池
 
 
-app = FastAPI(title="Agent Model Router", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Agent Model Router", version="1.4.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.3.0",
+    return {"status": "ok", "version": app.version,
             "tiers": {k: v[0] + f" (+{len(v)-1} fallback)" if len(v) > 1 else v[0]
                       for k, v in MODEL_POOLS.items() if k != "medium_hard"},
             "pools": MODEL_POOLS}
@@ -728,10 +746,9 @@ async def list_models():
         if real:
             pool = MODEL_POOLS[real]
             desc = f"{alias} 池: {' → '.join(pool)}"
-            if real == "medium":
-                desc += f" (难度>{MEDIUM_THRESHOLD} 改走: {' → '.join(MODEL_POOLS['medium_hard'])})"
         else:
-            desc = "难度自动路由(推荐)"
+            desc = ("难度自动路由(推荐): 规则分数<0.5 直接 cheap, 其余由 LLM judge "
+                    "4 分类(cheap/medium/medium_hard/smart) 权威判定")
         data.append({"id": alias, "object": "model", "owned_by": "agent-router",
                      "description": desc})
     return {"object": "list", "data": data}
@@ -782,7 +799,7 @@ def main():
         print("❌ 无法从 ~/.hermes/config.yaml 读取 Ollama token", file=sys.stderr)
         sys.exit(1)
 
-    print(f"🚀 Agent Model Router v1.3.0 启动")
+    print(f"🚀 Agent Model Router v{app.version} 启动")
     print(f"   OpenAI 协议:  http://{args.host}:{args.port}/v1/chat/completions (Hermes用)")
     print(f"   Anthropic协议: http://{args.host}:{args.port}/v1/messages (Claude用)")
     print(f"   后端: {OLLAMA_BASE}")
