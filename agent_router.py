@@ -466,12 +466,19 @@ def extract_usage_from_json(data: dict) -> tuple:
 
 
 def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
-                             status_code: int, latency_ms: int, stream: bool):
-    """把 Hermes 用量写入 cc-switch 统计 DB。model 必须是实际转发的模型名。"""
+                             status_code: int, latency_ms: int, stream: bool,
+                             requested: str = None):
+    """把 Hermes 用量写入 cc-switch 统计 DB。
+    model     = 实际转发的模型名(落地模型)。
+    requested = 调用方原始请求的 model 字段(可能是档位名 auto/flash/smart 或真实模型名)。
+                写入 request_model 列, 用于区分「请求了什么档位」——阈值校准必需。
+                缺省时回退为落地模型(向后兼容)。
+    """
     if not CC_SWITCH_DB.exists():
         return
     now = int(time.time())
     request_id = f"{HERMES_APP_TYPE}-{now}-{uuid.uuid4().hex[:8]}"
+    req_label = requested or model
     conn = None
     try:
         conn = sqlite3.connect(str(CC_SWITCH_DB), timeout=5)
@@ -482,7 +489,7 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
                  total_cost_usd, latency_ms, status_code, is_streaming,
                  cost_multiplier, created_at, data_source)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (request_id, HERMES_PROVIDER_ID, HERMES_APP_TYPE, model, model,
+            (request_id, HERMES_PROVIDER_ID, HERMES_APP_TYPE, model, req_label,
              max(0, input_tokens), max(0, output_tokens),
              "0", "0", "0", max(0, latency_ms), status_code,
              1 if stream else 0, "1.0", now, HERMES_APP_TYPE)
@@ -493,7 +500,7 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
             """SELECT request_count, input_tokens, output_tokens FROM usage_daily_rollups
                WHERE date = date('now') AND app_type = ? AND provider_id = ?
                  AND model = ? AND request_model = ? AND pricing_model = ''""",
-            (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model)
+            (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, req_label)
         ).fetchone()
         if row:
             conn.execute(
@@ -506,7 +513,7 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
                    WHERE date = date('now') AND app_type = ? AND provider_id = ?
                      AND model = ? AND request_model = ? AND pricing_model = ''""",
                 (ok, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms),
-                 HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model)
+                 HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, req_label)
             )
         else:
             conn.execute(
@@ -516,7 +523,7 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
                      cache_read_tokens, cache_creation_tokens,
                      total_cost_usd, avg_latency_ms)
                  VALUES (date('now'), ?, ?, ?, ?, '', 1, ?, ?, ?, 0, 0, '0', ?)""",
-                (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, model,
+                (HERMES_APP_TYPE, HERMES_PROVIDER_ID, model, req_label,
                  ok, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms))
             )
         conn.commit()
@@ -531,8 +538,10 @@ def write_usage_to_cc_switch(model: str, input_tokens: int, output_tokens: int,
                 pass
 
 
-async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int):
-    """流式转发包装器：透传 SSE chunk，流结束后解析 usage 并写入 cc-switch。"""
+async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int,
+                            requested: str = None):
+    """流式转发包装器：透传 SSE chunk，流结束后解析 usage 并写入 cc-switch。
+    requested = 调用方原始请求的 model 字段, 透传给 write_usage 记入 request_model。"""
     chunks = []
     try:
         async for chunk in resp.aiter_bytes():
@@ -559,7 +568,8 @@ async def stream_with_usage(resp, model: str, start_time: float, prompt_len: int
             input_tokens = max(1, prompt_len // 4)  # 兜底估算
         latency_ms = int((time.time() - start_time) * 1000)
         write_usage_to_cc_switch(model, input_tokens, output_tokens,
-                                 resp.status_code, latency_ms, stream=True)
+                                 resp.status_code, latency_ms, stream=True,
+                                 requested=requested)
 
 
 # ============ 转发逻辑 ============
@@ -589,6 +599,14 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
     stream = body.get("stream", False)
     start_time = time.time()
     last_err = None
+
+    # 请求标签: 显式档位/别名/真实模型名 → 原样记录;
+    # 难度自动路由(auto/未知名) → 记 "auto:<实际决策档位>", 便于按档位校准阈值。
+    req_raw = body.get("model")
+    if req_raw is None or resolve_tier(req_raw) is None:
+        req_label = f"auto:{tier}"
+    else:
+        req_label = req_raw
 
     for model in pool:
         if not _upstream_available(model):
@@ -627,7 +645,8 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
                 data = resp.json()
                 input_tokens, output_tokens = extract_usage_from_json(data)
                 write_usage_to_cc_switch(model, input_tokens, output_tokens,
-                                         resp.status_code, latency_ms, stream=False)
+                                         resp.status_code, latency_ms, stream=False,
+                                         requested=req_label)
             except Exception:
                 pass
             logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
@@ -645,7 +664,8 @@ async def _forward_with_failover(body: Dict[str, Any], tier: str, prompt: str,
         logger.info(f"openai[{stream}] upstream={resp.status_code} model={model} "
                     f"tier={tier} prompt_len={len(prompt)}")
         return StreamingResponse(
-            stream_with_usage(resp, model, start_time, len(prompt)),
+            stream_with_usage(resp, model, start_time, len(prompt),
+                              requested=req_label),
             status_code=resp.status_code,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
